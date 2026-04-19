@@ -1,0 +1,27 @@
+[package]
+name = "lindiction"
+version = "0.1.0"
+edition = "2021"
+description = "Linux push-to-talk voice dictation"
+license = "MIT"
+
+[[bin]]
+name = "lindiction"
+path = "src/main.rs"
+
+[lib]
+name = "lindiction"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+global-hotkey = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+whisper-rs = "0.11"
+
+[dev-dependencies]
+hound = "3.5"   # for reading WAV in integration tests
