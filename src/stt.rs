@@ -23,7 +23,9 @@ impl SttEngine {
         }
         info!(path = %model_path.display(), "loading whisper model");
         let ctx = WhisperContext::new_with_params(
-            model_path.to_str().context("model path is not valid UTF-8")?,
+            model_path
+                .to_str()
+                .context("model path is not valid UTF-8")?,
             WhisperContextParameters::default(),
         )
         .with_context(|| {
@@ -43,10 +45,7 @@ impl SttEngine {
         // FIXME(v0.2): create_state allocates ~180 MB of compute buffers per call.
         // Fine for PTT (one allocation per utterance, freed after), but a
         // persistent WhisperState would be better for a future streaming mode.
-        let mut state = self
-            .ctx
-            .create_state()
-            .context("creating whisper state")?;
+        let mut state = self.ctx.create_state().context("creating whisper state")?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         // FIXME(v0.2): language is hardcoded for the English-only tiny.en model.
@@ -65,11 +64,7 @@ impl SttEngine {
         let n = state.full_n_segments().context("segment count")?;
         let mut out = String::new();
         for i in 0..n {
-            out.push_str(
-                &state
-                    .full_get_segment_text(i)
-                    .context("segment text")?,
-            );
+            out.push_str(&state.full_get_segment_text(i).context("segment text")?);
         }
         let trimmed = out.trim();
         if is_non_speech_marker(trimmed) {
@@ -112,11 +107,11 @@ mod tests {
 
     #[test]
     fn marker_filter_preserves_real_speech() {
-        assert!(!is_non_speech_marker("[hello]"));             // lowercase
-        assert!(!is_non_speech_marker("[123]"));                // digits
-        assert!(!is_non_speech_marker("Hello world."));         // no brackets
-        assert!(!is_non_speech_marker("[BLANK_AUDIO] extra"));  // trailing content
-        assert!(!is_non_speech_marker("[]"));                   // empty brackets
-        assert!(!is_non_speech_marker(""));                     // empty string
+        assert!(!is_non_speech_marker("[hello]")); // lowercase
+        assert!(!is_non_speech_marker("[123]")); // digits
+        assert!(!is_non_speech_marker("Hello world.")); // no brackets
+        assert!(!is_non_speech_marker("[BLANK_AUDIO] extra")); // trailing content
+        assert!(!is_non_speech_marker("[]")); // empty brackets
+        assert!(!is_non_speech_marker("")); // empty string
     }
 }

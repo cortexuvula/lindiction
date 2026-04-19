@@ -40,25 +40,20 @@ pub fn start() -> Result<(HotkeyListener, mpsc::Receiver<HotkeyEvent>)> {
     std::thread::Builder::new()
         .name("lindiction-hotkey".into())
         .spawn(move || {
-            loop {
-                match crate_rx.recv() {
-                    Ok(event) => {
-                        // Only forward events for our registered hotkey; other hotkeys
-                        // in the process (none today, but possible in the future) share
-                        // the same singleton channel.
-                        if event.id != hotkey_id {
-                            continue;
-                        }
-                        let mapped = match event.state {
-                            HotKeyState::Pressed => HotkeyEvent::Press,
-                            HotKeyState::Released => HotkeyEvent::Release,
-                        };
-                        debug!(?mapped, "hotkey event");
-                        if tx.blocking_send(mapped).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break, // channel closed
+            while let Ok(event) = crate_rx.recv() {
+                // Only forward events for our registered hotkey; other hotkeys
+                // in the process (none today, but possible in the future) share
+                // the same singleton channel.
+                if event.id != hotkey_id {
+                    continue;
+                }
+                let mapped = match event.state {
+                    HotKeyState::Pressed => HotkeyEvent::Press,
+                    HotKeyState::Released => HotkeyEvent::Release,
+                };
+                debug!(?mapped, "hotkey event");
+                if tx.blocking_send(mapped).is_err() {
+                    break;
                 }
             }
         })

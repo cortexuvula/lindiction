@@ -37,21 +37,20 @@ impl App {
                     let len_seconds = audio.len() as f32 / 16_000.0;
                     debug!(samples = audio.len(), seconds = len_seconds, "transcribing");
                     let stt_for_task = Arc::clone(&stt_worker);
-                    let text = match tokio::task::spawn_blocking(move || {
-                        stt_for_task.transcribe(&audio)
-                    })
-                    .await
-                    {
-                        Ok(Ok(t)) => t,
-                        Ok(Err(e)) => {
-                            error!(error = %e, "transcription failed");
-                            continue;
-                        }
-                        Err(join) => {
-                            error!(error = %join, "transcription task join error");
-                            continue;
-                        }
-                    };
+                    let text =
+                        match tokio::task::spawn_blocking(move || stt_for_task.transcribe(&audio))
+                            .await
+                        {
+                            Ok(Ok(t)) => t,
+                            Ok(Err(e)) => {
+                                error!(error = %e, "transcription failed");
+                                continue;
+                            }
+                            Err(join) => {
+                                error!(error = %join, "transcription task join error");
+                                continue;
+                            }
+                        };
                     if text.is_empty() {
                         debug!("empty transcription, nothing to inject");
                         continue;

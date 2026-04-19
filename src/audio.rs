@@ -18,9 +18,9 @@ pub fn start_capture(
     channels: u16,
 ) -> Result<(AudioStream, mpsc::UnboundedReceiver<Vec<f32>>)> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default audio input device — check `pactl list sources short`"))?;
+    let device = host.default_input_device().ok_or_else(|| {
+        anyhow!("no default audio input device — check `pactl list sources short`")
+    })?;
 
     let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
     info!(device = %device_name, "opening input device");
