@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Whisper models (large, downloaded separately)
+/models/*.bin
+/models/*.gguf
+
+# Claude session state
+/.remember/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
