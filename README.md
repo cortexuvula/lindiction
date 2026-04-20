@@ -13,34 +13,35 @@ MVP scope: Ubuntu 24.04 / X11 / GNOME. Wayland, system tray, systemd service, `.
 
 ## Install
 
-### System packages
+### From .deb (recommended)
+
+Download the latest `.deb` from the [releases page](https://github.com/cortexuvula/lindiction/releases) and install:
+
+```bash
+wget https://github.com/cortexuvula/lindiction/releases/latest/download/lindiction-v0.3.0-amd64.deb
+sudo apt install ./lindiction-v0.3.0-amd64.deb
+```
+
+First run will auto-download the default tiny.en whisper model (~77 MB) to `~/.local/share/lindiction/models/` — expect a one-time ~20-second delay on initial launch.
+
+### From source
+
+Install system packages:
 
 ```bash
 sudo apt update
 sudo apt install -y \
     xdotool build-essential cmake pkg-config \
-    libclang-dev libasound2-dev libpulse-dev curl
+    libclang-dev libasound2-dev libpulse-dev libdbus-1-dev curl
 ```
 
-### Whisper model
-
-Download the `tiny.en` model (~75 MB, fast, English-only):
-
-```bash
-mkdir -p models
-curl -L -o models/ggml-tiny.en.bin \
-    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
-```
-
-For better accuracy at higher latency, download `ggml-base.en.bin` (~142 MB) and pass it via `--model`.
-
-### Build
+Build:
 
 ```bash
 cargo build --release
 ```
 
-First build takes several minutes (compiles whisper.cpp from source).
+First build takes several minutes (compiles whisper.cpp from source). First run auto-downloads the model; no manual `curl` step needed.
 
 ## Run
 
@@ -60,6 +61,29 @@ Press Ctrl+C in the daemon terminal to exit.
 | `-v` / `-vv` | Debug / trace logging. |
 | `--help` | Print help. |
 | `--version` | Print version. |
+
+### Auto-start with systemd (optional)
+
+To run lindiction automatically on login and restart on crash:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now lindiction
+journalctl --user -u lindiction -f    # tail logs
+```
+
+To disable auto-start:
+
+```bash
+systemctl --user disable --now lindiction
+```
+
+The unit file is installed by the `.deb` at `/lib/systemd/user/lindiction.service`. If you built from source, copy it yourself:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/lindiction.service ~/.config/systemd/user/
+```
 
 ## Configuration
 
@@ -106,9 +130,30 @@ capitalize_sentences = false
 ensure_trailing_period = false
 ```
 
+## Migrating from v0.2
+
+The default model path moved from `models/ggml-tiny.en.bin` (relative to the working directory) to `~/.local/share/lindiction/models/ggml-tiny.en.bin` (XDG data directory).
+
+Three options:
+
+1. **Do nothing.** Launch the daemon — auto-download fetches a fresh `ggml-tiny.en.bin` to the new default location. One-time delay, no other action needed.
+2. **Move the existing file:**
+   ```bash
+   mkdir -p ~/.local/share/lindiction/models
+   mv models/ggml-tiny.en.bin ~/.local/share/lindiction/models/
+   ```
+3. **Pin the old location** in `~/.config/lindiction/config.toml`:
+   ```toml
+   [model]
+   path = "/absolute/path/to/your/models/ggml-tiny.en.bin"
+   ```
+   Or use `LINDICTION_MODEL=/path/to/model.bin lindiction`.
+
+No other breaking changes. Hotkey config, postprocess config, all existing TOML fields work identically.
+
 ## Troubleshooting
 
-**"Model not found"** — download the model with the curl command above. The default expected path is `./models/ggml-tiny.en.bin` relative to the current working directory.
+**"Model not found"** — first launch auto-downloads the default model. If it fails (network issue, etc.), rerun the daemon to retry. To use an existing local model, pass `--model /path/to/model.bin` or set `LINDICTION_MODEL=/path/to/model.bin`.
 
 **"xdotool not found"** — `sudo apt install xdotool`.
 
@@ -123,6 +168,24 @@ ensure_trailing_period = false
 **Text appears in the wrong window** — `xdotool type` types into the currently-focused window. Focus the target window before releasing the hotkey.
 
 **Transcriptions are gibberish** — the `tiny.en` model is fast but imprecise. Switch to `ggml-base.en.bin` via `--model`.
+
+**"curl exited with…" on first run** — the auto-download failed. Check your network, then relaunch. The partial download is automatically cleaned up. As a manual fallback:
+
+```bash
+mkdir -p ~/.local/share/lindiction/models
+curl -L -o ~/.local/share/lindiction/models/ggml-tiny.en.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+```
+
+**Tray icon doesn't appear** — on Ubuntu 24.04 GNOME, the AppIndicator extension is pre-installed and active. On vanilla upstream GNOME, install and enable it:
+
+```bash
+sudo apt install gnome-shell-extension-appindicator
+# then enable "Ubuntu AppIndicators" in the Extensions app, or via:
+gnome-extensions enable ubuntu-appindicators@ubuntu.com
+```
+
+The daemon runs fine without a tray icon — the hotkey still works.
 
 ## Testing
 
