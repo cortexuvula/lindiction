@@ -3,6 +3,20 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+/// Resolve the default model path to `$XDG_DATA_HOME/lindiction/models/ggml-tiny.en.bin`
+/// (typically `~/.local/share/lindiction/models/ggml-tiny.en.bin`).
+///
+/// This is the single source of truth for the default — consumed by
+/// `ModelConfig::default` AND by `model_download::ensure_default_model`
+/// (which only auto-downloads when `config.model.path == default_model_path()`).
+pub fn default_model_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("lindiction")
+        .join("models")
+        .join("ggml-tiny.en.bin")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -49,7 +63,7 @@ impl Default for HotkeyConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from("models/ggml-tiny.en.bin"),
+            path: default_model_path(),
         }
     }
 }
@@ -142,9 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn default_model_path() {
+    fn default_model_path_matches_xdg() {
         let c = Config::default();
-        assert_eq!(c.model.path, PathBuf::from("models/ggml-tiny.en.bin"));
+        assert_eq!(c.model.path, super::default_model_path());
+        // Verify the helper returns an absolute path ending with
+        // lindiction/models/ggml-tiny.en.bin.
+        let p = super::default_model_path();
+        assert!(
+            p.ends_with("lindiction/models/ggml-tiny.en.bin"),
+            "got {}",
+            p.display()
+        );
     }
 
     #[test]
@@ -202,7 +224,7 @@ binding = "f10"
 "#;
         let c: Config = toml::from_str(s).expect("parse");
         assert_eq!(c.hotkey.binding, "f10");
-        assert_eq!(c.model.path, PathBuf::from("models/ggml-tiny.en.bin"));
+        assert_eq!(c.model.path, super::default_model_path());
         assert!(c.postprocess.remove_fillers);
     }
 
@@ -226,7 +248,7 @@ nonsense = true
         isolate_xdg();
         std::env::remove_var("LINDICTION_MODEL");
         let c = Config::load(None).expect("load");
-        assert_eq!(c.model.path, PathBuf::from("models/ggml-tiny.en.bin"));
+        assert_eq!(c.model.path, super::default_model_path());
         assert_eq!(c.hotkey.binding, "ctrl+alt+space");
         std::env::remove_var("XDG_CONFIG_HOME");
     }
