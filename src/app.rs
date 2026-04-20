@@ -2,6 +2,7 @@ use crate::audio::{start_capture, AudioStream};
 use crate::config::Config;
 use crate::hotkey::{parse_binding, start as start_hotkey, HotkeyEvent, HotkeyListener};
 use crate::inject::Injector;
+use crate::model_download;
 use crate::postprocess::Postprocessor;
 use crate::stt::SttEngine;
 use crate::tray::{TrayEvent, TrayManager};
@@ -22,6 +23,11 @@ impl App {
         let injector = Injector::new(config.xdotool_delay_ms);
         let postprocessor = Postprocessor::new(&config.postprocess)
             .context("building postprocessor from config.postprocess")?;
+
+        // Auto-download the default model on first run (no-op if the file
+        // is already present or if the user specified a custom path).
+        model_download::ensure_default_model(&config.model.path)
+            .context("ensuring default whisper model is available")?;
 
         let mut tray = TrayManager::start();
         tray.set_state(TrayEvent::Idle);
