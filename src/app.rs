@@ -4,6 +4,7 @@ use crate::hotkey::{parse_binding, start as start_hotkey, HotkeyEvent, HotkeyLis
 use crate::inject::Injector;
 use crate::postprocess::Postprocessor;
 use crate::stt::SttEngine;
+use crate::tray::{TrayEvent, TrayManager};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -22,6 +23,13 @@ impl App {
         let postprocessor = Postprocessor::new(&config.postprocess)
             .context("building postprocessor from config.postprocess")?;
 
+        let mut tray = TrayManager::start();
+        tray.set_state(TrayEvent::Idle);
+
+        // One-way signal from the transcription worker to the select loop
+        // telling the tray to return to Idle after an utterance finishes.
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(4);
+
         // Load the model upfront — fail fast on a bad model path or corrupt file.
         let stt = Arc::new(
             SttEngine::load(&config.model.path)
@@ -36,40 +44,55 @@ impl App {
             let injector_worker = injector.clone();
             let stt_worker = Arc::clone(&stt);
             let postprocessor_worker = postprocessor.clone();
+            let done_tx_worker = done_tx.clone();
             tokio::spawn(async move {
                 while let Some(audio) = transcribe_rx.recv().await {
                     let len_seconds = audio.len() as f32 / 16_000.0;
                     debug!(samples = audio.len(), seconds = len_seconds, "transcribing");
                     let stt_for_task = Arc::clone(&stt_worker);
-                    let text =
-                        match tokio::task::spawn_blocking(move || stt_for_task.transcribe(&audio))
-                            .await
+                    let injector_inner = injector_worker.clone();
+                    let postprocessor_inner = postprocessor_worker.clone();
+
+                    async {
+                        let text = match tokio::task::spawn_blocking(move || {
+                            stt_for_task.transcribe(&audio)
+                        })
+                        .await
                         {
                             Ok(Ok(t)) => t,
                             Ok(Err(e)) => {
                                 error!(error = %e, "transcription failed");
-                                continue;
+                                return;
                             }
                             Err(join) => {
                                 error!(error = %join, "transcription task join error");
-                                continue;
+                                return;
                             }
                         };
-                    if text.is_empty() {
-                        debug!("empty transcription, nothing to inject");
-                        continue;
+                        if text.is_empty() {
+                            debug!("empty transcription, nothing to inject");
+                            return;
+                        }
+                        let clean = postprocessor_inner.apply(&text);
+                        if clean.trim().is_empty() {
+                            debug!(raw = %text, "empty after postprocess, nothing to inject");
+                            return;
+                        }
+                        info!(text = %clean, "injecting");
+                        if let Err(e) = injector_inner.inject(&clean).await {
+                            // Intentionally omitting `text` to keep potentially sensitive
+                            // dictated content out of the log sink. Rerun with -vv and
+                            // a test utterance to diagnose xdotool-layer failures.
+                            error!(error = %e, "injection failed");
+                        }
                     }
-                    let clean = postprocessor_worker.apply(&text);
-                    if clean.trim().is_empty() {
-                        debug!(raw = %text, "empty after postprocess, nothing to inject");
-                        continue;
-                    }
-                    info!(text = %clean, "injecting");
-                    if let Err(e) = injector_worker.inject(&clean).await {
-                        // Intentionally omitting `text` to keep potentially sensitive
-                        // dictated content out of the log sink. Rerun with -vv and
-                        // a test utterance to diagnose xdotool-layer failures.
-                        error!(error = %e, "injection failed");
+                    .await;
+
+                    // Always notify the tray bridge that this utterance is done,
+                    // regardless of which skip branch fired above.
+                    if done_tx_worker.send(()).await.is_err() {
+                        debug!("done channel closed; exiting worker");
+                        break;
                     }
                 }
             })
@@ -120,6 +143,7 @@ impl App {
                             recording = true;
                             buffer.clear();
                             info!("recording started");
+                            tray.set_state(TrayEvent::Recording);
                         }
                     }
                     Some(HotkeyEvent::Release) => {
@@ -132,10 +156,13 @@ impl App {
                             let seconds = audio.len() as f32 / 16_000.0;
                             info!(seconds, "recording stopped");
                             match transcribe_tx.try_send(audio) {
-                                Ok(()) => {},
+                                Ok(()) => {
+                                    tray.set_state(TrayEvent::Processing);
+                                }
                                 Err(mpsc::error::TrySendError::Full(dropped)) => {
                                     let s = dropped.len() as f32 / 16_000.0;
                                     warn!(seconds = s, "transcribe queue full, dropping utterance");
+                                    tray.set_state(TrayEvent::Idle);
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     error!("transcribe worker closed; shutting down");
@@ -154,6 +181,27 @@ impl App {
                     None => {
                         error!("audio channel closed; shutting down");
                         break;
+                    }
+                },
+                maybe_done = done_rx.recv() => match maybe_done {
+                    Some(()) => {
+                        debug!("worker finished utterance; tray back to Idle");
+                        tray.set_state(TrayEvent::Idle);
+                    }
+                    None => {
+                        error!("done channel closed; shutting down");
+                        break;
+                    }
+                },
+                maybe_quit = tray.shutdown_signal().recv() => match maybe_quit {
+                    Some(()) => {
+                        info!("tray Quit activated; shutting down");
+                        break;
+                    }
+                    None => {
+                        // Tray bridge task exited. Daemon can keep running via hotkey,
+                        // but this is a surprising state — log and continue rather than abort.
+                        warn!("tray shutdown channel closed; continuing without tray");
                     }
                 },
                 _ = tokio::signal::ctrl_c() => {
