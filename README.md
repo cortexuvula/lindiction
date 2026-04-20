@@ -61,6 +61,51 @@ Press Ctrl+C in the daemon terminal to exit.
 | `--help` | Print help. |
 | `--version` | Print version. |
 
+## Configuration
+
+Lindiction reads an optional TOML file at `~/.config/lindiction/config.toml` (or `$XDG_CONFIG_HOME/lindiction/config.toml`). If the file is absent, the built-in defaults apply. Unknown fields are rejected at startup.
+
+Precedence for the model path: `--model` CLI flag > `LINDICTION_MODEL` env var > `[model].path` in TOML > default (`models/ggml-tiny.en.bin`).
+
+### Full schema with defaults
+
+```toml
+[hotkey]
+# Hotkey binding: "+"-separated, case-insensitive.
+# Modifiers: ctrl (alias: control), alt, shift, super (alias: meta).
+# Keys: letters a-z, digits 0-9, space, enter (alias: return), tab,
+#       escape (alias: esc), backspace, f1-f24, arrow keys
+#       (up, down, left, right).
+binding = "ctrl+alt+space"
+
+[model]
+# Path to GGML whisper model file.
+path = "models/ggml-tiny.en.bin"
+
+[postprocess]
+# Remove common filler words before injection (case-insensitive, word-boundary).
+remove_fillers = true
+filler_words = ["um", "uh", "ah", "like", "you know", "so", "basically"]
+
+# Uppercase the first letter of the utterance and of each sentence
+# that follows `. `, `? `, or `! `.
+capitalize_sentences = true
+
+# Append a `.` if the final character is not `.`, `?`, or `!`.
+ensure_trailing_period = true
+```
+
+### Opt out of postprocessing
+
+To get raw whisper output (v0.1 behaviour), set all three toggles to `false`:
+
+```toml
+[postprocess]
+remove_fillers = false
+capitalize_sentences = false
+ensure_trailing_period = false
+```
+
 ## Troubleshooting
 
 **"Model not found"** — download the model with the curl command above. The default expected path is `./models/ggml-tiny.en.bin` relative to the current working directory.
@@ -69,7 +114,11 @@ Press Ctrl+C in the daemon terminal to exit.
 
 **"No audio input device"** — run `pactl list sources short`. If empty, your PipeWire/PulseAudio is not running. Log out and back in, or `systemctl --user restart pipewire`.
 
-**"Hotkey registration failed"** — another application is bound to Ctrl+Alt+Space. Close it, or edit `src/hotkey.rs` to choose a different binding (v0.2 will make this configurable at runtime).
+**"Hotkey registration failed"** — another application is bound to your configured hotkey. Close it, or change `[hotkey].binding` in your config file.
+
+**"Config parse error" / "Unknown config field"** — the TOML file at `~/.config/lindiction/config.toml` has a syntax error or uses a field name that is not part of the current schema. Check it against the schema in the Configuration section above, or delete the file to fall back to defaults.
+
+**"Invalid hotkey binding"** — the `[hotkey] binding` value could not be parsed. Valid modifiers are `ctrl` (alias `control`), `alt`, `shift`, `super` (alias `meta`). Valid keys are letters `a`–`z`, digits `0`–`9`, `space`, `enter` (alias `return`), `tab`, `escape` (alias `esc`), `backspace`, `f1`–`f24`, and arrow keys (`up`, `down`, `left`, `right`). Example bindings: `"ctrl+alt+space"`, `"f12"`, `"super+shift+d"`.
 
 **Text appears in the wrong window** — `xdotool type` types into the currently-focused window. Focus the target window before releasing the hotkey.
 
