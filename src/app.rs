@@ -21,8 +21,8 @@ impl App {
 
         // Load the model upfront — fail fast on a bad model path or corrupt file.
         let stt = Arc::new(
-            SttEngine::load(&config.model_path)
-                .with_context(|| format!("loading model from {}", config.model_path.display()))?,
+            SttEngine::load(&config.model.path)
+                .with_context(|| format!("loading model from {}", config.model.path.display()))?,
         );
 
         // Transcription worker task: reads audio buffers from an mpsc channel

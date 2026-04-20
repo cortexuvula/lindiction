@@ -7,12 +7,12 @@ use tracing_subscriber::EnvFilter;
 
 /// Lindiction — push-to-talk voice dictation for Linux.
 ///
-/// Hold Ctrl+Alt+Space to record. Release to transcribe and inject
-/// the text at the cursor.
+/// Hold Ctrl+Alt+Space (or your configured binding) to record. Release to
+/// transcribe and inject the text at the cursor.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Path to GGML whisper model file
+    /// Path to GGML whisper model file (overrides TOML config and env var)
     #[arg(long, env = "LINDICTION_MODEL")]
     model: Option<PathBuf>,
 
@@ -34,10 +34,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| EnvFilter::new(format!("lindiction={level},warn")));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let mut config = Config::load();
-    if let Some(m) = cli.model {
-        config = config.with_model_path(m);
-    }
+    let config = Config::load(cli.model)?;
 
     App::run(config).await
 }
