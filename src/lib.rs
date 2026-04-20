@@ -3,6 +3,7 @@ pub mod audio;
 pub mod config;
 pub mod hotkey;
 pub mod inject;
+pub mod model_download;
 pub mod postprocess;
 pub mod stt;
 pub mod tray;
