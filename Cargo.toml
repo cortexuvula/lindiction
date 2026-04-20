@@ -31,3 +31,23 @@ which = "6"
 
 [dev-dependencies]
 hound = "3.5"   # for reading WAV in integration tests
+
+[package.metadata.deb]
+maintainer = "Andre Hugo <cortexpeterpan@gmail.com>"
+copyright = "2026, Andre Hugo"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Push-to-talk voice dictation for Linux using whisper.cpp.
+Hold Ctrl+Alt+Space, speak, release, and the transcribed text is typed
+at the cursor. First run auto-downloads the default tiny.en model
+(~77 MB).
+"""
+depends = "$auto, xdotool, curl, libasound2, libpulse0"
+section = "sound"
+priority = "optional"
+assets = [
+    ["target/release/lindiction", "usr/bin/", "755"],
+    ["systemd/lindiction.service", "lib/systemd/user/", "644"],
+    ["README.md", "usr/share/doc/lindiction/README", "644"],
+    ["LICENSE", "usr/share/doc/lindiction/copyright", "644"],
+]

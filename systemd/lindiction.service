@@ -1,0 +1,14 @@
+[Unit]
+Description=Lindiction voice dictation
+After=graphical-session.target sound.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lindiction
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=lindiction=info
+
+[Install]
+WantedBy=default.target
