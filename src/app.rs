@@ -2,6 +2,7 @@ use crate::audio::{start_capture, AudioStream};
 use crate::config::Config;
 use crate::hotkey::{parse_binding, start as start_hotkey, HotkeyEvent, HotkeyListener};
 use crate::inject::Injector;
+use crate::postprocess::Postprocessor;
 use crate::stt::SttEngine;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -18,6 +19,8 @@ impl App {
         }
 
         let injector = Injector::new(config.xdotool_delay_ms);
+        let postprocessor = Postprocessor::new(&config.postprocess)
+            .context("building postprocessor from config.postprocess")?;
 
         // Load the model upfront — fail fast on a bad model path or corrupt file.
         let stt = Arc::new(
@@ -32,6 +35,7 @@ impl App {
         let worker = {
             let injector_worker = injector.clone();
             let stt_worker = Arc::clone(&stt);
+            let postprocessor_worker = postprocessor.clone();
             tokio::spawn(async move {
                 while let Some(audio) = transcribe_rx.recv().await {
                     let len_seconds = audio.len() as f32 / 16_000.0;
@@ -55,8 +59,13 @@ impl App {
                         debug!("empty transcription, nothing to inject");
                         continue;
                     }
-                    info!(text = %text, "injecting");
-                    if let Err(e) = injector_worker.inject(&text).await {
+                    let clean = postprocessor_worker.apply(&text);
+                    if clean.trim().is_empty() {
+                        debug!(raw = %text, "empty after postprocess, nothing to inject");
+                        continue;
+                    }
+                    info!(text = %clean, "injecting");
+                    if let Err(e) = injector_worker.inject(&clean).await {
                         // Intentionally omitting `text` to keep potentially sensitive
                         // dictated content out of the log sink. Rerun with -vv and
                         // a test utterance to diagnose xdotool-layer failures.
