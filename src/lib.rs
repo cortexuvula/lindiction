@@ -5,3 +5,4 @@ pub mod hotkey;
 pub mod inject;
 pub mod postprocess;
 pub mod stt;
+pub mod tray;
