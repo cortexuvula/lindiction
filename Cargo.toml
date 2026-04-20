@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 cpal = "0.15"
 dirs = "5"
 global-hotkey = "0.5"
+ksni = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "process", "time"] }
