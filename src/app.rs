@@ -1,6 +1,6 @@
 use crate::audio::{start_capture, AudioStream};
 use crate::config::Config;
-use crate::hotkey::{start as start_hotkey, HotkeyEvent, HotkeyListener};
+use crate::hotkey::{parse_binding, start as start_hotkey, HotkeyEvent, HotkeyListener};
 use crate::inject::Injector;
 use crate::stt::SttEngine;
 use anyhow::{Context, Result};
@@ -67,13 +67,19 @@ impl App {
         };
 
         // Hotkey stream
-        let (_hotkey_listener, mut hotkey_rx): (HotkeyListener, _) = start_hotkey()?;
+        let (modifiers, code) = parse_binding(&config.hotkey.binding).with_context(|| {
+            format!(
+                "parsing hotkey binding `{}` from config",
+                config.hotkey.binding
+            )
+        })?;
+        let (_hotkey_listener, mut hotkey_rx): (HotkeyListener, _) = start_hotkey(modifiers, code)?;
 
         // Audio stream
         let (_audio_stream, mut audio_rx): (AudioStream, _) =
             start_capture(config.sample_rate, config.channels)?;
 
-        info!("ready — hold Ctrl+Alt+Space to dictate");
+        info!(hotkey = %config.hotkey.binding, "ready — hold the hotkey to dictate");
 
         let mut recording = false;
         // FIXME(v0.2): no upper bound on recording duration. A 5-minute hold
