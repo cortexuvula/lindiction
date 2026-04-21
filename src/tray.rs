@@ -61,14 +61,35 @@ impl ksni::Tray for LindictionTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
-        vec![StandardItem {
-            label: "Quit".into(),
-            activate: Box::new(|this: &mut Self| {
-                let _ = this.shutdown_tx.try_send(());
-            }),
-            ..Default::default()
-        }
-        .into()]
+        vec![
+            StandardItem {
+                label: "Open config\u{2026}".into(),
+                activate: Box::new(|_: &mut Self| open_config()),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "About Lindiction".into(),
+                activate: Box::new(|_: &mut Self| about()),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Help".into(),
+                activate: Box::new(|_: &mut Self| help()),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.shutdown_tx.try_send(());
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
     }
 }
 
@@ -154,9 +175,136 @@ impl Drop for TrayManager {
     }
 }
 
+/// Open the TOML config file in the user's default editor, creating an
+/// empty file if it doesn't exist yet. Empty TOML is valid — it parses
+/// to all defaults thanks to `#[serde(default)]` on every config struct.
+fn open_config() {
+    let Some(path) = crate::config::config_file_path() else {
+        warn!("could not resolve XDG config path; Open config has no target");
+        return;
+    };
+
+    if let Err(e) = ensure_config_file_exists(&path) {
+        warn!(error = %e, path = %path.display(), "could not create config file");
+        notify_warn(&format!("Could not create {}: {}", path.display(), e));
+        return;
+    }
+
+    // `xdg-open`'s exit code is unreliable across distros (some backends
+    // return non-zero even on success). We only flag spawn failures
+    // (Err from `.status()`), not non-zero exits.
+    if let Err(e) = std::process::Command::new("xdg-open").arg(&path).status() {
+        warn!(error = %e, "xdg-open failed");
+        notify_warn(&format!("xdg-open failed: {e}"));
+    }
+}
+
+/// Create the config file at `path` if missing. No-op if the file already
+/// exists. Creates all parent directories as needed. Written empty — the
+/// user's editor (or their subsequent config authoring) fills it in.
+fn ensure_config_file_exists(path: &std::path::Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, "")?;
+    info!(path = %path.display(), "created empty config file");
+    Ok(())
+}
+
+/// Show a desktop notification with version, license, and the repo URL.
+/// Best-effort: if the notification subsystem is unavailable, silently no-op.
+fn about() {
+    let _ = notify_rust::Notification::new()
+        .appname("Lindiction")
+        .summary(&format!("Lindiction v{}", env!("CARGO_PKG_VERSION")))
+        .body(
+            "Push-to-talk voice dictation for Linux.\n\
+             MIT licensed.\n\
+             https://github.com/cortexuvula/lindiction",
+        )
+        .icon("audio-input-microphone")
+        .timeout(notify_rust::Timeout::Milliseconds(6000))
+        .show();
+}
+
+/// Open the project's GitHub page in the user's default browser.
+fn help() {
+    const REPO_URL: &str = "https://github.com/cortexuvula/lindiction";
+    // `xdg-open`'s exit code is unreliable across distros — only flag spawn
+    // failures (Err from `.status()`), not non-zero exits.
+    if let Err(e) = std::process::Command::new("xdg-open")
+        .arg(REPO_URL)
+        .status()
+    {
+        warn!(error = %e, "xdg-open failed");
+        notify_warn(&format!("xdg-open failed: {e}"));
+    }
+}
+
+/// Best-effort warning notification. Used when a menu action fails in a way
+/// the user would want to know about (e.g. xdg-open not installed).
+fn notify_warn(msg: &str) {
+    let _ = notify_rust::Notification::new()
+        .appname("Lindiction")
+        .summary("Lindiction — action failed")
+        .body(msg)
+        .icon("dialog-warning")
+        .timeout(notify_rust::Timeout::Milliseconds(5000))
+        .show();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lindiction-tray-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn ensure_config_file_creates_empty_when_missing() {
+        let dir = fresh_temp_dir("create-empty");
+        let path = dir.join("lindiction").join("config.toml");
+        assert!(!path.exists(), "precondition: path must not exist");
+
+        super::ensure_config_file_exists(&path).expect("should create");
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_file_leaves_existing_unchanged() {
+        let dir = fresh_temp_dir("leave-existing");
+        let config_dir = dir.join("lindiction");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("config.toml");
+        let existing_content = "[hotkey]\nbinding = \"f9\"\n";
+        std::fs::write(&path, existing_content).unwrap();
+
+        super::ensure_config_file_exists(&path).expect("should no-op");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing_content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_file_creates_nested_parents() {
+        let dir = fresh_temp_dir("nested-parents");
+        let path = dir.join("a").join("b").join("c").join("config.toml");
+        assert!(!path.exists());
+
+        super::ensure_config_file_exists(&path).expect("should create nested");
+        assert!(path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn icon_name_is_distinct_per_state() {
