@@ -5,16 +5,25 @@ use crate::inject::Injector;
 use crate::model_download;
 use crate::postprocess::Postprocessor;
 use crate::stt::SttEngine;
-use crate::tray::{TrayEvent, TrayManager};
+use crate::tray::{ControlCmd, TrayEvent, TrayManager};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// How `App::run` wants the process to exit. `main` inspects this and
+/// either returns normally (`Quit`) or exec-replaces the current binary
+/// (`Restart`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitAction {
+    Quit,
+    Restart,
+}
+
 pub struct App;
 
 impl App {
-    pub async fn run(config: Config) -> Result<()> {
+    pub async fn run(config: Config) -> Result<ExitAction> {
         // Preflight: verify xdotool is present before we accept any audio.
         if which::which("xdotool").is_err() {
             anyhow::bail!("xdotool not found on PATH. Install: sudo apt install xdotool");
@@ -120,6 +129,17 @@ impl App {
         info!(hotkey = %config.hotkey.binding, "ready — hold the hotkey to dictate");
 
         let mut recording = false;
+        // Ephemeral by design — not persisted across restart. See README
+        // "Auto-start on login" / Pause section for the rationale.
+        let mut paused = false;
+        // Tracks which exit reason, if any, broke the select loop. Default
+        // is Quit — reassigned to Restart on the matching tray command.
+        let mut exit_action = ExitAction::Quit;
+        // After the tray's control channel closes (ksni thread gone / DBus
+        // down), an unguarded `recv()` arm would fire `None` on every loop
+        // iteration and burn CPU. This flag disables the arm after the
+        // first close.
+        let mut tray_control_open = true;
         // FIXME(v0.2): no upper bound on recording duration. A 5-minute hold
         // accumulates ~19 MB; a 30-minute stuck-hotkey scenario is 115 MB.
         // Consider a max-samples cap that auto-releases with a warn.
@@ -129,7 +149,9 @@ impl App {
             tokio::select! {
                 maybe_evt = hotkey_rx.recv() => match maybe_evt {
                     Some(HotkeyEvent::Press) => {
-                        if recording {
+                        if paused {
+                            debug!("press ignored while paused");
+                        } else if recording {
                             debug!("duplicate press ignored");
                         } else {
                             // Discard any audio buffered in the channel from before the press.
@@ -153,7 +175,9 @@ impl App {
                         }
                     }
                     Some(HotkeyEvent::Release) => {
-                        if !recording {
+                        if paused {
+                            debug!("release ignored while paused");
+                        } else if !recording {
                             debug!("release without prior press ignored");
                         } else {
                             recording = false;
@@ -191,23 +215,56 @@ impl App {
                 },
                 maybe_done = done_rx.recv() => match maybe_done {
                     Some(()) => {
-                        debug!("worker finished utterance; tray back to Idle");
-                        tray.set_state(TrayEvent::Idle);
+                        // A worker finishing during pause would otherwise
+                        // stomp the Paused icon with Idle. Keep the tray
+                        // consistent with the authoritative `paused` bool.
+                        if paused {
+                            debug!("worker finished utterance while paused; keeping Paused icon");
+                        } else {
+                            debug!("worker finished utterance; tray back to Idle");
+                            tray.set_state(TrayEvent::Idle);
+                        }
                     }
                     None => {
                         error!("done channel closed; shutting down");
                         break;
                     }
                 },
-                maybe_quit = tray.shutdown_signal().recv() => match maybe_quit {
-                    Some(()) => {
+                maybe_cmd = tray.control_signal().recv(), if tray_control_open => match maybe_cmd {
+                    Some(ControlCmd::Quit) => {
                         info!("tray Quit activated; shutting down");
+                        exit_action = ExitAction::Quit;
                         break;
+                    }
+                    Some(ControlCmd::Restart) => {
+                        info!("tray Restart activated; exec-replacing after clean shutdown");
+                        exit_action = ExitAction::Restart;
+                        break;
+                    }
+                    Some(ControlCmd::TogglePause) => {
+                        paused = !paused;
+                        if paused {
+                            // If the user paused mid-hold, drop the in-flight
+                            // buffer rather than transcribing a partial utterance
+                            // on resume. "Pause" implies "forget what was happening."
+                            if recording {
+                                recording = false;
+                                buffer.clear();
+                                warn!("paused mid-recording; discarding utterance");
+                            }
+                            info!("paused");
+                            tray.set_state(TrayEvent::Paused);
+                        } else {
+                            info!("resumed");
+                            tray.set_state(TrayEvent::Idle);
+                        }
                     }
                     None => {
                         // Tray bridge task exited. Daemon can keep running via hotkey,
-                        // but this is a surprising state — log and continue rather than abort.
-                        warn!("tray shutdown channel closed; continuing without tray");
+                        // but this is a surprising state — log, disable the arm so we
+                        // don't hot-loop on closed-channel polls, and continue.
+                        warn!("tray control channel closed; continuing without tray");
+                        tray_control_open = false;
                     }
                 },
                 _ = tokio::signal::ctrl_c() => {
@@ -225,8 +282,10 @@ impl App {
         drop(transcribe_tx);
         // worker.await may block up to ~800 ms if a whisper spawn_blocking call
         // is in flight at shutdown. This is intentional: we let the current
-        // inference finish rather than leaking a blocking thread.
+        // inference finish rather than leaking a blocking thread. Restart
+        // paths rely on this invariant — an execve replacement after an
+        // incomplete inference would silently drop the utterance.
         let _ = worker.await;
-        Ok(())
+        Ok(exit_action)
     }
 }

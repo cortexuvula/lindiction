@@ -1,5 +1,6 @@
 pub mod app;
 pub mod audio;
+pub mod autostart;
 pub mod config;
 pub mod hotkey;
 pub mod inject;
