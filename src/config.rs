@@ -31,6 +31,7 @@ pub struct Config {
     pub hotkey: HotkeyConfig,
     pub model: ModelConfig,
     pub postprocess: PostprocessConfig,
+    pub update: UpdateConfig,
     #[serde(skip)]
     pub sample_rate: u32,
     #[serde(skip)]
@@ -58,6 +59,17 @@ pub struct PostprocessConfig {
     pub filler_words: Vec<String>,
     pub capitalize_sentences: bool,
     pub ensure_trailing_period: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Master switch. When false, the daemon performs no network calls
+    /// to GitHub and hides the tray "Check for updates" item.
+    pub enabled: bool,
+    /// How often to recheck while the daemon runs. 0 = startup only.
+    /// A check is also always performed at daemon launch when enabled.
+    pub interval_hours: u64,
 }
 
 impl Default for HotkeyConfig {
@@ -90,12 +102,22 @@ impl Default for PostprocessConfig {
     }
 }
 
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_hours: 6,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: HotkeyConfig::default(),
             model: ModelConfig::default(),
             postprocess: PostprocessConfig::default(),
+            update: UpdateConfig::default(),
             sample_rate: 16_000,
             channels: 1,
             xdotool_delay_ms: 5,
@@ -185,6 +207,25 @@ mod tests {
         assert!(c.postprocess.capitalize_sentences);
         assert!(c.postprocess.ensure_trailing_period);
         assert!(!c.postprocess.filler_words.is_empty());
+    }
+
+    #[test]
+    fn default_update_config_is_opt_in() {
+        let c = Config::default();
+        assert!(c.update.enabled, "update checks default to enabled");
+        assert_eq!(c.update.interval_hours, 6);
+    }
+
+    #[test]
+    fn update_section_parses_both_fields() {
+        let s = r#"
+[update]
+enabled = false
+interval_hours = 24
+"#;
+        let c: Config = toml::from_str(s).expect("parse");
+        assert!(!c.update.enabled);
+        assert_eq!(c.update.interval_hours, 24);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::autostart;
+use semver::Version;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -44,9 +45,16 @@ pub enum ControlCmd {
     /// Flip the paused state. The App loop owns the authoritative bool;
     /// the tray mirrors it locally for checkbox rendering.
     TogglePause,
-    /// Graceful shutdown followed by exec-replace with the current binary
-    /// (handled by `main.rs`). Used to pick up config changes without
-    /// asking the user to relaunch.
+    /// User clicked "Check for updates". The App replies with a desktop
+    /// notification about the result, whether or not one is available.
+    CheckForUpdates,
+    /// User clicked "Update to vX.Y.Z…". The App spawns the install job
+    /// and, on success, sends itself a Restart to switch to the new binary.
+    InstallUpdate,
+    /// Graceful shutdown followed by process-image replacement via the
+    /// execve syscall (handled by `main.rs`). Used to pick up config
+    /// changes, or a freshly installed binary, without asking the user
+    /// to relaunch.
     Restart,
     /// Graceful shutdown. Process exits normally.
     Quit,
@@ -70,6 +78,35 @@ struct LindictionTray {
     autostart_enabled: bool,
     autostart_supported: bool,
     paused: bool,
+    /// `Some(v)` when the App's update checker has found a release newer
+    /// than the running version. Drives both the tray icon badge and the
+    /// "Update to vX.Y.Z…" menu item.
+    update_available: Option<Version>,
+    /// Whether the user has updates enabled in config. When false, we hide
+    /// the "Check for updates" menu item (and the App never publishes an
+    /// `update_available` value anyway).
+    update_check_enabled: bool,
+}
+
+impl LindictionTray {
+    /// Pick the icon to render. The update badge is only shown when the
+    /// daemon is idle — we don't want to hide Recording/Processing/Paused
+    /// feedback, which is more time-sensitive. User sees the badge next
+    /// time they're back to Idle. (Menu item is visible regardless.)
+    fn effective_icon_name(&self) -> &'static str {
+        if self.update_available.is_some() && self.state == TrayEvent::Idle {
+            "software-update-available"
+        } else {
+            self.state.icon_name()
+        }
+    }
+
+    fn effective_tooltip(&self) -> String {
+        match &self.update_available {
+            Some(v) => format!("{} — update to v{v} available", self.state.tooltip()),
+            None => self.state.tooltip().to_string(),
+        }
+    }
 }
 
 impl ksni::Tray for LindictionTray {
@@ -82,22 +119,40 @@ impl ksni::Tray for LindictionTray {
     }
 
     fn icon_name(&self) -> String {
-        self.state.icon_name().to_string()
+        self.effective_icon_name().to_string()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            title: self.state.tooltip().to_string(),
+            title: self.effective_tooltip(),
             ..Default::default()
         }
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::{CheckmarkItem, StandardItem};
-        // Order: the two most-frequent toggles on top (Pause, Open config),
-        // then Auto-start (rare toggle), then info items, then the two
+        let mut items: Vec<ksni::MenuItem<Self>> = Vec::new();
+
+        // "Update to vX.Y.Z…" goes above everything else when present —
+        // it's the most time-sensitive action the user can take.
+        if let Some(v) = &self.update_available {
+            items.push(
+                StandardItem {
+                    label: format!("Update to v{v}\u{2026}"),
+                    activate: Box::new(|this: &mut Self| {
+                        let _ = this.control_tx.send(ControlCmd::InstallUpdate);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(ksni::MenuItem::Separator);
+        }
+
+        // Order: frequent toggles (Pause, Open config), then optional
+        // toggles (Auto-start, Check for updates), then info, then the
         // lifecycle actions at the bottom (Restart, Quit).
-        let mut items: Vec<ksni::MenuItem<Self>> = vec![
+        items.push(
             CheckmarkItem {
                 label: "Pause".into(),
                 checked: self.paused,
@@ -105,13 +160,15 @@ impl ksni::Tray for LindictionTray {
                 ..Default::default()
             }
             .into(),
+        );
+        items.push(
             StandardItem {
                 label: "Open config\u{2026}".into(),
                 activate: Box::new(|_: &mut Self| open_config()),
                 ..Default::default()
             }
             .into(),
-        ];
+        );
 
         // Only surface the autostart toggle when systemctl --user is usable.
         // On non-systemd distros or headless SSH sessions without linger,
@@ -122,6 +179,22 @@ impl ksni::Tray for LindictionTray {
                     label: "Auto-start on login".into(),
                     checked: self.autostart_enabled,
                     activate: Box::new(|this: &mut Self| toggle_autostart(this)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        // Only offer manual update checks when the config enables the
+        // auto-checker — keeps "updates disabled" from being a partial
+        // state where the tray still fires network calls.
+        if self.update_check_enabled {
+            items.push(
+                StandardItem {
+                    label: "Check for updates\u{2026}".into(),
+                    activate: Box::new(|this: &mut Self| {
+                        let _ = this.control_tx.send(ControlCmd::CheckForUpdates);
+                    }),
                     ..Default::default()
                 }
                 .into(),
@@ -146,8 +219,9 @@ impl ksni::Tray for LindictionTray {
             StandardItem {
                 label: "Restart".into(),
                 activate: Box::new(|this: &mut Self| {
-                    // Restart reloads config via exec-replace. If the channel
-                    // is closed, the App loop has already exited; nothing to do.
+                    // Restart reloads config via process-image replacement.
+                    // If the channel is closed, the App loop has already
+                    // exited; nothing to do.
                     let _ = this.control_tx.send(ControlCmd::Restart);
                 }),
                 ..Default::default()
@@ -184,7 +258,7 @@ impl TrayManager {
     /// DBus session, or a StatusNotifier host is not present), this
     /// returns a manager whose `set_state` is a no-op and whose control
     /// channel never fires. The daemon still works via hotkey.
-    pub fn start() -> Self {
+    pub fn start(update_check_enabled: bool) -> Self {
         let (state_tx, mut state_rx) = mpsc::unbounded_channel::<TrayEvent>();
         // Unbounded so fast user clicks never drop a toggle. The receiver
         // lives on the main event loop, which drains promptly.
@@ -204,6 +278,9 @@ impl TrayManager {
             autostart_supported,
             // Pause always starts off on a fresh launch — ephemeral state by design.
             paused: false,
+            // No update known at startup; populated by the App's first check.
+            update_available: None,
+            update_check_enabled,
         };
 
         // ksni 0.2.2's spawn() calls self.run().unwrap() in a background
@@ -262,6 +339,14 @@ impl TrayManager {
     /// UI-cache-only invariant documented on LindictionTray honest.
     pub fn set_paused(&self, paused: bool) {
         self.handle.update(|t| t.paused = paused);
+    }
+
+    /// Publish the result of an update check into the tray's UI state.
+    /// `Some(v)` lights up the badge + "Update to vX.Y.Z…" menu item;
+    /// `None` clears both. Called from the App after each check (startup,
+    /// periodic, user-triggered) and after a successful install.
+    pub fn set_update_available(&self, latest: Option<Version>) {
+        self.handle.update(|t| t.update_available = latest);
     }
 }
 

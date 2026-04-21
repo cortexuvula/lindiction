@@ -6,10 +6,55 @@ use crate::model_download;
 use crate::postprocess::Postprocessor;
 use crate::stt::SttEngine;
 use crate::tray::{ControlCmd, TrayEvent, TrayManager};
+use crate::update::{self, UpdateInfo};
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Result of an update check or install, as delivered to the App's select
+/// loop via mpsc. Carrying the result through the loop (rather than firing
+/// tray actions directly from the background task) keeps all state
+/// mutations in one place.
+///
+/// `CheckResult` carries an `UpdateInfo` which is string-heavy; clippy
+/// flags the size delta between variants. Messages flow at user-click
+/// cadence (not per audio frame), so boxing isn't worth the indirection.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum UpdateEvent {
+    /// A check completed. Value is Some(info) if an update is available,
+    /// None if we're already current. The `manual` flag distinguishes a
+    /// user-clicked "Check for updates" from a periodic tick — the former
+    /// always gets a result notification, the latter is silent on no-news.
+    CheckResult {
+        manual: bool,
+        result: Result<Option<UpdateInfo>>,
+    },
+    /// An install job completed. Ok(()) triggers a Restart; Err shows a
+    /// notification and leaves the badge visible so the user can retry.
+    InstallResult(Result<()>),
+}
+
+/// Best-effort desktop notification. Runs on `spawn_blocking` because
+/// `notify_rust::Notification::show()` is synchronous DBus and could
+/// briefly stall the tokio scheduler otherwise. We don't care about the
+/// result — if the notification daemon is unavailable, the tray state
+/// change is the fallback signal.
+fn notify(summary: &str, body: &str) {
+    let summary = summary.to_string();
+    let body = body.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = notify_rust::Notification::new()
+            .appname("Lindiction")
+            .summary(&summary)
+            .body(&body)
+            .icon("audio-input-microphone")
+            .timeout(notify_rust::Timeout::Milliseconds(5000))
+            .show();
+    });
+}
 
 /// How `App::run` wants the process to exit. `main` inspects this and
 /// either returns normally (`Quit`) or exec-replaces the current binary
@@ -38,12 +83,59 @@ impl App {
         model_download::ensure_default_model(&config.model.path)
             .context("ensuring default whisper model is available")?;
 
-        let mut tray = TrayManager::start();
+        let mut tray = TrayManager::start(config.update.enabled);
         tray.set_state(TrayEvent::Idle);
 
         // One-way signal from the transcription worker to the select loop
         // telling the tray to return to Idle after an utterance finishes.
         let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(4);
+
+        // Background update-check and install tasks write results back
+        // to the select loop via this channel. Size 4 is plenty — checks
+        // are rare and results always consumed promptly.
+        let (update_evt_tx, mut update_evt_rx) = mpsc::channel::<UpdateEvent>(4);
+
+        // Kick off the startup update check if enabled. Automatic, not
+        // manual — silent on "already current."
+        if config.update.enabled {
+            let tx = update_evt_tx.clone();
+            tokio::spawn(async move {
+                let result = update::check().await;
+                let _ = tx
+                    .send(UpdateEvent::CheckResult {
+                        manual: false,
+                        result,
+                    })
+                    .await;
+            });
+        }
+
+        // Periodic update check loop. Only spawned if interval_hours > 0
+        // (0 meaning startup-only per config docs). The initial tick
+        // fires immediately — we skip it because we just kicked off the
+        // startup check above.
+        if config.update.enabled && config.update.interval_hours > 0 {
+            let tx = update_evt_tx.clone();
+            let interval_secs = config.update.interval_hours.saturating_mul(3600);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+                tick.tick().await; // drain the immediately-ready first tick
+                loop {
+                    tick.tick().await;
+                    let result = update::check().await;
+                    if tx
+                        .send(UpdateEvent::CheckResult {
+                            manual: false,
+                            result,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break; // select loop exited; stop polling
+                    }
+                }
+            });
+        }
 
         // Load the model upfront — fail fast on a bad model path or corrupt file.
         let stt = Arc::new(
@@ -140,6 +232,10 @@ impl App {
         // iteration and burn CPU. This flag disables the arm after the
         // first close.
         let mut tray_control_open = true;
+        // Latest update check result. Populated by the background checker
+        // tasks, read when the user clicks "Update to vX.Y.Z…" so we know
+        // which artifacts to fetch.
+        let mut latest_update: Option<UpdateInfo> = None;
         // FIXME(v0.2): no upper bound on recording duration. A 5-minute hold
         // accumulates ~19 MB; a 30-minute stuck-hotkey scenario is 115 MB.
         // Consider a max-samples cap that auto-releases with a warn.
@@ -237,9 +333,36 @@ impl App {
                         break;
                     }
                     Some(ControlCmd::Restart) => {
-                        info!("tray Restart activated; exec-replacing after clean shutdown");
+                        info!("tray Restart activated; replacing process image after clean shutdown");
                         exit_action = ExitAction::Restart;
                         break;
+                    }
+                    Some(ControlCmd::CheckForUpdates) => {
+                        let tx = update_evt_tx.clone();
+                        tokio::spawn(async move {
+                            let result = update::check().await;
+                            let _ = tx
+                                .send(UpdateEvent::CheckResult {
+                                    manual: true,
+                                    result,
+                                })
+                                .await;
+                        });
+                    }
+                    Some(ControlCmd::InstallUpdate) => {
+                        let Some(info) = latest_update.clone() else {
+                            warn!("InstallUpdate clicked but no pending update; ignoring");
+                            continue;
+                        };
+                        notify(
+                            &format!("Downloading lindiction v{}…", info.latest),
+                            "You'll be prompted to approve the install.",
+                        );
+                        let tx = update_evt_tx.clone();
+                        tokio::spawn(async move {
+                            let result = update::install(&info).await;
+                            let _ = tx.send(UpdateEvent::InstallResult(result)).await;
+                        });
                     }
                     Some(ControlCmd::TogglePause) => {
                         paused = !paused;
@@ -265,6 +388,74 @@ impl App {
                         // don't hot-loop on closed-channel polls, and continue.
                         warn!("tray control channel closed; continuing without tray");
                         tray_control_open = false;
+                    }
+                },
+                maybe_evt = update_evt_rx.recv() => match maybe_evt {
+                    Some(UpdateEvent::CheckResult { manual, result }) => {
+                        match result {
+                            Ok(Some(info)) => {
+                                info!(
+                                    latest = %info.latest,
+                                    current = %info.current,
+                                    manual,
+                                    "update available"
+                                );
+                                tray.set_update_available(Some(info.latest.clone()));
+                                notify(
+                                    &format!("Lindiction v{} available", info.latest),
+                                    "Click the tray icon to install.",
+                                );
+                                latest_update = Some(info);
+                            }
+                            Ok(None) => {
+                                debug!(manual, "no update available");
+                                tray.set_update_available(None);
+                                latest_update = None;
+                                if manual {
+                                    notify("Lindiction is up to date", "");
+                                }
+                            }
+                            Err(e) => {
+                                // Periodic failures (offline, rate-limited) are
+                                // not worth bothering the user about; only the
+                                // user-triggered path surfaces them.
+                                if manual {
+                                    warn!(error = %e, "manual update check failed");
+                                    notify(
+                                        "Update check failed",
+                                        &format!("{e:#}"),
+                                    );
+                                } else {
+                                    debug!(error = %e, "automatic update check failed; will retry on next tick");
+                                }
+                            }
+                        }
+                    }
+                    Some(UpdateEvent::InstallResult(Ok(()))) => {
+                        info!("update install succeeded; triggering Restart");
+                        tray.set_update_available(None);
+                        // `latest_update` is intentionally NOT cleared — we're
+                        // about to break and drop the whole scope.
+                        notify(
+                            "Update installed",
+                            "Lindiction is restarting into the new version.",
+                        );
+                        exit_action = ExitAction::Restart;
+                        break;
+                    }
+                    Some(UpdateEvent::InstallResult(Err(e))) => {
+                        error!(error = %e, "update install failed");
+                        notify(
+                            "Update failed",
+                            &format!("{e:#}"),
+                        );
+                        // Keep the badge visible so the user can retry.
+                    }
+                    None => {
+                        // All update senders were dropped. We hold one
+                        // clone ourselves; this shouldn't happen during
+                        // normal operation.
+                        debug!("update event channel closed");
                     }
                 },
                 _ = tokio::signal::ctrl_c() => {

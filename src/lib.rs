@@ -8,3 +8,4 @@ pub mod model_download;
 pub mod postprocess;
 pub mod stt;
 pub mod tray;
+pub mod update;
