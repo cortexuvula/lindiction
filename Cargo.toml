@@ -20,6 +20,7 @@ cpal = "0.15"
 dirs = "5"
 global-hotkey = "0.5"
 ksni = "0.2"
+notify-rust = { version = "4", default-features = false, features = ["d"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "process", "time"] }
