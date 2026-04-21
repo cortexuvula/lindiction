@@ -17,6 +17,14 @@ pub fn default_model_path() -> PathBuf {
         .join("ggml-tiny.en.bin")
 }
 
+/// Path to the TOML config file: `$XDG_CONFIG_HOME/lindiction/config.toml`
+/// (typically `~/.config/lindiction/config.toml`). Returns `None` only when
+/// neither `$XDG_CONFIG_HOME` nor `$HOME` is set — essentially impossible
+/// in practice on Linux.
+pub fn config_file_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("lindiction").join("config.toml"))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -112,7 +120,7 @@ impl Config {
     }
 
     fn from_xdg_file() -> Result<Self> {
-        let Some(path) = Self::config_path() else {
+        let Some(path) = config_file_path() else {
             // `dirs::config_dir()` returns None only when neither $HOME nor
             // $XDG_CONFIG_HOME is set — essentially impossible in practice.
             // The design spec called for a fatal exit here; we soften to
@@ -134,11 +142,6 @@ impl Config {
                 path.display()
             )
         })
-    }
-
-    /// `~/.config/lindiction/config.toml` (or `$XDG_CONFIG_HOME/lindiction/config.toml`).
-    fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("lindiction").join("config.toml"))
     }
 }
 
@@ -327,5 +330,16 @@ path = "/from/toml.bin"
 
         std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_file_path_ends_correctly() {
+        // If the environment resolves $XDG_CONFIG_HOME (or $HOME on Linux),
+        // the path must end with lindiction/config.toml. If the env is so
+        // broken that dirs::config_dir returns None, the function returns
+        // None — acceptable, and we skip the assertion.
+        if let Some(p) = super::config_file_path() {
+            assert!(p.ends_with("lindiction/config.toml"), "got {}", p.display());
+        }
     }
 }
