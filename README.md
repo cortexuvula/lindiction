@@ -62,6 +62,17 @@ Press Ctrl+C in the daemon terminal to exit.
 | `--help` | Print help. |
 | `--version` | Print version. |
 
+### Tray menu
+
+When the daemon is running, a microphone icon appears in the system tray. Left-click it (or right-click, depending on your desktop) to open the menu:
+
+- **Open config…** — opens `~/.config/lindiction/config.toml` in your default text editor, creating an empty file if it doesn't exist yet. Save the file and restart the daemon to pick up changes.
+- **About Lindiction** — shows a short desktop notification with the current version, license, and project URL.
+- **Help** — opens [this repository](https://github.com/cortexuvula/lindiction) in your default browser.
+- **Quit** — exits the daemon cleanly (same as Ctrl-C in the daemon's terminal).
+
+The tray icon also changes color to reflect daemon state: dim microphone (idle), red dot (recording), refresh spinner (transcribing).
+
 ### Auto-start with systemd (optional)
 
 To run lindiction automatically on login and restart on crash:
