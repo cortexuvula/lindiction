@@ -57,6 +57,12 @@ jobs:
           # cargo-deb names the file from Cargo.toml's version;
           # prefer a tag-based name for the release attachment.
           cp target/debian/lindiction_*_amd64.deb "./lindiction-${REF_NAME}-amd64.deb"
+          # Publish a SHA256 sidecar alongside the .deb so the auto-updater
+          # (see src/update.rs) can verify integrity the same way it does
+          # for the tarball. Defense-in-depth: HTTPS + GitHub already cover
+          # transport, but this catches storage bit-rot and keeps verification
+          # consistent across install methods.
+          sha256sum "lindiction-${REF_NAME}-amd64.deb" > "lindiction-${REF_NAME}-amd64.deb.sha256"
 
       - name: Create GitHub Release
         env:
@@ -68,4 +74,5 @@ jobs:
             --generate-notes \
             "lindiction-${REF_NAME}-x86_64-linux.tar.gz" \
             "lindiction-${REF_NAME}-x86_64-linux.tar.gz.sha256" \
-            "lindiction-${REF_NAME}-amd64.deb"
+            "lindiction-${REF_NAME}-amd64.deb" \
+            "lindiction-${REF_NAME}-amd64.deb.sha256"
