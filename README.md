@@ -62,38 +62,54 @@ Press Ctrl+C in the daemon terminal to exit.
 | `--help` | Print help. |
 | `--version` | Print version. |
 
+### Subcommands
+
+| Subcommand | Purpose |
+|---|---|
+| `lindiction autostart enable` | Enable auto-start on graphical login (systemd `--user` unit). |
+| `lindiction autostart disable` | Disable auto-start on login. |
+| `lindiction autostart status` | Print the current enabled/disabled state. |
+
 ### Tray menu
 
 When the daemon is running, a microphone icon appears in the system tray. Left-click it (or right-click, depending on your desktop) to open the menu:
 
-- **Open config…** — opens `~/.config/lindiction/config.toml` in your default text editor, creating an empty file if it doesn't exist yet. Save the file and restart the daemon to pick up changes.
+- **Pause** — checkbox that mutes the hotkey while keeping the daemon resident. Presses and releases are ignored until you uncheck it. If you pause mid-hold, the in-flight recording is discarded rather than transcribed on resume. Pause state is ephemeral — it does not persist across restart or login.
+- **Open config…** — opens `~/.config/lindiction/config.toml` in your default text editor, creating an empty file if it doesn't exist yet. Save the file and click **Restart** below to pick up changes.
+- **Auto-start on login** — checkbox that enables or disables the systemd user unit in place. Equivalent to `lindiction autostart enable|disable` below. Hidden when `systemctl --user` is unavailable.
 - **About Lindiction** — shows a short desktop notification with the current version, license, and project URL.
 - **Help** — opens [this repository](https://github.com/cortexuvula/lindiction) in your default browser.
+- **Restart** — graceful shutdown followed by re-launching the daemon with the same arguments. The easiest way to apply config changes without logging out. Any in-flight transcription finishes before the restart. Under a systemd user unit this is invisible to systemd (PID and cgroup are preserved via `execve`).
 - **Quit** — exits the daemon cleanly (same as Ctrl-C in the daemon's terminal).
 
-The tray icon also changes color to reflect daemon state: dim microphone (idle), red dot (recording), refresh spinner (transcribing).
+The tray icon also changes color to reflect daemon state: dim microphone (idle), red dot (recording), refresh spinner (transcribing), pause glyph (paused).
 
-### Auto-start with systemd (optional)
+### Auto-start on login
 
-To run lindiction automatically on login and restart on crash:
+The easiest way to toggle auto-start is the tray checkbox above. From the command line:
+
+```bash
+lindiction autostart enable     # start automatically next login
+lindiction autostart disable    # stop starting automatically
+lindiction autostart status     # print the current state
+```
+
+"Auto-start on login" means the daemon starts when you log in to your graphical session — this is a systemd **user** unit (`WantedBy=default.target`), not a system service. The daemon needs your audio session and X display, neither of which exist before you log in.
+
+The subcommand works whether you installed via `.deb` or built from source. On source builds, it writes a generated unit file to `~/.config/systemd/user/lindiction.service` pointing at the current binary, then `systemctl --user daemon-reload && enable`. On `.deb` installs, it uses the system-wide unit at `/lib/systemd/user/lindiction.service` as-is.
+
+Tail the logs:
+
+```bash
+journalctl --user -u lindiction -f
+```
+
+The manual systemd invocation still works if you prefer it:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now lindiction
-journalctl --user -u lindiction -f    # tail logs
-```
-
-To disable auto-start:
-
-```bash
 systemctl --user disable --now lindiction
-```
-
-The unit file is installed by the `.deb` at `/lib/systemd/user/lindiction.service`. If you built from source, copy it yourself:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/lindiction.service ~/.config/systemd/user/
 ```
 
 ## Configuration
