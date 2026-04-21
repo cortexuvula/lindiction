@@ -43,10 +43,12 @@ impl Status {
         match self {
             Status::Enabled => "enabled — lindiction will start automatically on login".into(),
             Status::Disabled => "disabled — lindiction will not start automatically".into(),
-            Status::NotInstalled => format!(
-                "not installed — {UNIT_NAME} was not found in any systemd search path"
-            ),
-            Status::SystemctlMissing => "systemctl not found on PATH; cannot manage autostart".into(),
+            Status::NotInstalled => {
+                format!("not installed — {UNIT_NAME} was not found in any systemd search path")
+            }
+            Status::SystemctlMissing => {
+                "systemctl not found on PATH; cannot manage autostart".into()
+            }
             Status::Other(s) => format!("unexpected state: {s}"),
         }
     }
@@ -148,7 +150,10 @@ pub fn enable() -> Result<()> {
 pub fn disable() -> Result<()> {
     ensure_systemctl()?;
     if matches!(status(), Status::NotInstalled) {
-        debug!(unit = UNIT_NAME, "already not installed; disable is a no-op");
+        debug!(
+            unit = UNIT_NAME,
+            "already not installed; disable is a no-op"
+        );
         return Ok(());
     }
     let out = Command::new("systemctl")

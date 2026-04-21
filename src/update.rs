@@ -26,8 +26,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-const GITHUB_API_URL: &str =
-    "https://api.github.com/repos/cortexuvula/lindiction/releases/latest";
+const GITHUB_API_URL: &str = "https://api.github.com/repos/cortexuvula/lindiction/releases/latest";
 
 fn user_agent() -> String {
     // GitHub API requires a User-Agent header. Identify ourselves so any
@@ -107,11 +106,11 @@ fn detect_install_method_for(exe: &Path) -> InstallMethod {
 ///   should log at debug and move on; callers on user-triggered checks
 ///   should surface the error to the user.
 pub async fn check() -> Result<Option<UpdateInfo>> {
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .context("parsing current package version")?;
+    let current =
+        Version::parse(env!("CARGO_PKG_VERSION")).context("parsing current package version")?;
     let raw = fetch_latest_release_json().await?;
-    let parsed: GithubRelease = serde_json::from_str(&raw)
-        .context("parsing GitHub release JSON")?;
+    let parsed: GithubRelease =
+        serde_json::from_str(&raw).context("parsing GitHub release JSON")?;
     build_update_info(current, parsed)
 }
 
@@ -140,7 +139,10 @@ fn build_update_info(current: Version, parsed: GithubRelease) -> Result<Option<U
     let tarball = find_primary("-x86_64-linux.tar.gz")
         .ok_or_else(|| anyhow!("release {} is missing a tarball asset", parsed.tag_name))?;
     let tarball_sha = find_sha("-x86_64-linux.tar.gz").ok_or_else(|| {
-        anyhow!("release {} is missing a tarball .sha256 asset", parsed.tag_name)
+        anyhow!(
+            "release {} is missing a tarball .sha256 asset",
+            parsed.tag_name
+        )
     })?;
     let deb_sha = find_sha("-amd64.deb");
     Ok(Some(UpdateInfo {
@@ -285,8 +287,7 @@ async fn install_tarball(info: &UpdateInfo) -> Result<()> {
     // over the original. If the parent directory is not user-writable,
     // we'd have been routed to Deb install instead — so permission here
     // should always succeed.
-    let exe =
-        std::env::current_exe().context("resolving current binary path for rename target")?;
+    let exe = std::env::current_exe().context("resolving current binary path for rename target")?;
     let parent = exe
         .parent()
         .ok_or_else(|| anyhow!("current binary {} has no parent directory", exe.display()))?;
@@ -447,7 +448,10 @@ mod tests {
             Some("https://example.test/deb.sha256")
         );
         assert_eq!(info.tarball_url, "https://example.test/tarball");
-        assert_eq!(info.tarball_sha256_url, "https://example.test/tarball.sha256");
+        assert_eq!(
+            info.tarball_sha256_url,
+            "https://example.test/tarball.sha256"
+        );
     }
 
     #[test]
