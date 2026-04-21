@@ -74,15 +74,48 @@ Press Ctrl+C in the daemon terminal to exit.
 
 When the daemon is running, a microphone icon appears in the system tray. Left-click it (or right-click, depending on your desktop) to open the menu:
 
+- **Update to vX.Y.Z…** *(only when an update is available)* — downloads the latest release, verifies SHA256, installs via `pkexec apt install` (for `.deb` installs) or atomic rename (for `~/.cargo/bin` / `~/.local/bin` / `~/bin` installs), then auto-restarts into the new binary. See the **Auto-update** section below.
 - **Pause** — checkbox that mutes the hotkey while keeping the daemon resident. Presses and releases are ignored until you uncheck it. If you pause mid-hold, the in-flight recording is discarded rather than transcribed on resume. Pause state is ephemeral — it does not persist across restart or login.
 - **Open config…** — opens `~/.config/lindiction/config.toml` in your default text editor, creating an empty file if it doesn't exist yet. Save the file and click **Restart** below to pick up changes.
 - **Auto-start on login** — checkbox that enables or disables the systemd user unit in place. Equivalent to `lindiction autostart enable|disable` below. Hidden when `systemctl --user` is unavailable.
+- **Check for updates…** *(hidden when `[update] enabled = false`)* — force an immediate GitHub check and show the result as a notification.
 - **About Lindiction** — shows a short desktop notification with the current version, license, and project URL.
 - **Help** — opens [this repository](https://github.com/cortexuvula/lindiction) in your default browser.
 - **Restart** — graceful shutdown followed by re-launching the daemon with the same arguments. The easiest way to apply config changes without logging out. Any in-flight transcription finishes before the restart. Under a systemd user unit this is invisible to systemd (PID and cgroup are preserved via `execve`).
 - **Quit** — exits the daemon cleanly (same as Ctrl-C in the daemon's terminal).
 
-The tray icon also changes color to reflect daemon state: dim microphone (idle), red dot (recording), refresh spinner (transcribing), pause glyph (paused).
+The tray icon reflects daemon state: dim microphone (idle), red dot (recording), refresh spinner (transcribing), pause glyph (paused), or a software-update badge when a new release is available *and* the daemon is currently idle (the in-progress states take precedence over the badge so time-sensitive feedback stays visible).
+
+### Auto-update
+
+Lindiction periodically polls the [GitHub Releases API](https://api.github.com/repos/cortexuvula/lindiction/releases/latest) for a newer version. When one is found, the tray icon switches to a software-update badge and a new **Update to vX.Y.Z…** menu item appears. Clicking it downloads the correct artifact for your install (tarball or `.deb`), verifies its SHA256, installs it, and restarts the daemon automatically.
+
+Two install flows:
+
+- **.deb installs** (binary at `/usr/bin/lindiction`): `pkexec apt install <new.deb>`. A polkit dialog pops up showing the exact command — approve with your password. Keeps `dpkg` state clean.
+- **Source / cargo installs** (binary in `~/.cargo/bin`, `~/.local/bin`, or `~/bin`): atomic rename in place. No password needed. The new binary takes effect on the subsequent auto-restart.
+
+Development builds (anywhere else, e.g. `target/release/`) refuse auto-install. Rebuild from git or install via the release `.deb` instead.
+
+#### Trust model
+
+The update path trusts HTTPS and GitHub Releases. SHA256 verification catches bit-rot but does **not** defend against a compromised GitHub account pushing a malicious release. GPG signing is a planned follow-up. If that's not acceptable for your threat model, disable network checks entirely:
+
+```toml
+[update]
+enabled = false
+```
+
+#### Config
+
+```toml
+[update]
+# Check for new releases on GitHub. Set false to skip ALL network calls.
+enabled = true
+# How often to recheck while the daemon runs, in hours. 0 = startup only.
+# A check is always performed once at daemon launch when enabled.
+interval_hours = 6
+```
 
 ### Auto-start on login
 
@@ -144,6 +177,12 @@ capitalize_sentences = true
 
 # Append a `.` if the final character is not `.`, `?`, or `!`.
 ensure_trailing_period = true
+
+[update]
+# Check GitHub for new releases and badge the tray icon when found.
+enabled = true
+# Recheck interval in hours. 0 = startup only (always checks once at launch).
+interval_hours = 6
 ```
 
 ### Opt out of postprocessing
