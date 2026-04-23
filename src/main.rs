@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use lindiction::app::{App, ExitAction};
 use lindiction::autostart;
 use lindiction::config::Config;
+use lindiction::replace::{self, AddOutcome};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +35,10 @@ enum Command {
     /// Manage auto-start on graphical login via the systemd --user unit.
     #[command(subcommand)]
     Autostart(AutostartAction),
+    /// Manage the [postprocess].replacements word-fix dictionary without
+    /// hand-editing config.toml.
+    #[command(subcommand)]
+    Replace(ReplaceAction),
 }
 
 #[derive(Subcommand, Debug)]
@@ -44,6 +49,28 @@ enum AutostartAction {
     Disable,
     /// Print the current enabled/disabled status.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReplaceAction {
+    /// Add (or overwrite) a replacement: `lindiction replace add clod Claude`.
+    /// Matches the running daemon's own behavior: case-insensitive,
+    /// word-bounded.
+    Add {
+        /// The misheard word/phrase to look for.
+        from: String,
+        /// The text to substitute in (spelled how you want it to appear).
+        to: String,
+    },
+    /// Print all configured replacements in file order.
+    List,
+    /// Remove the replacement whose `from` matches (case-insensitive).
+    Remove {
+        /// The `from` side of the entry to delete.
+        from: String,
+    },
+    /// Open the config file in `$EDITOR` for free-form editing.
+    Edit,
 }
 
 fn main() -> ExitCode {
@@ -60,6 +87,13 @@ fn main() -> ExitCode {
 
     match cli.command {
         Some(Command::Autostart(action)) => match run_autostart(action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Replace(action)) => match run_replace(action) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -92,6 +126,70 @@ fn run_autostart(action: AutostartAction) -> Result<()> {
         }
         AutostartAction::Status => {
             println!("{}", autostart::status().describe());
+            Ok(())
+        }
+    }
+}
+
+/// Print the "restart the daemon to apply" hint after mutating the
+/// config. Kept short on purpose — longer text buries the update
+/// confirmation. The suggested command works if the user is on the
+/// bundled systemd --user unit; if they run the daemon manually they
+/// will figure out their own restart path from this hint.
+fn print_restart_hint() {
+    println!("Restart the daemon to apply: systemctl --user restart lindiction");
+}
+
+/// Run a `replace` subcommand. All actions touch only the config file
+/// (or spawn $EDITOR) — they don't talk to a running daemon.
+fn run_replace(action: ReplaceAction) -> Result<()> {
+    match action {
+        ReplaceAction::Add { from, to } => {
+            match replace::add(&from, &to)? {
+                AddOutcome::Added => {
+                    println!("Added: {from} → {to}");
+                }
+                AddOutcome::Updated { previous } => {
+                    println!("Updated: {from} → {to}  (was: {previous})");
+                }
+            }
+            print_restart_hint();
+            Ok(())
+        }
+        ReplaceAction::List => {
+            let items = replace::list()?;
+            if items.is_empty() {
+                println!("(no replacements configured)");
+                return Ok(());
+            }
+            // Left-aligned `from` column sized to the longest entry so
+            // the arrows line up — poor man's table without bringing
+            // in a formatting crate.
+            let width = items
+                .iter()
+                .map(|(f, _)| f.chars().count())
+                .max()
+                .unwrap_or(0);
+            for (from, to) in items {
+                println!("{from:<width$}  →  {to}");
+            }
+            Ok(())
+        }
+        ReplaceAction::Remove { from } => {
+            match replace::remove(&from)? {
+                Some(prev) => {
+                    println!("Removed: {from} → {prev}");
+                    print_restart_hint();
+                }
+                None => {
+                    println!("No replacement for `{from}` (case-insensitive match).");
+                }
+            }
+            Ok(())
+        }
+        ReplaceAction::Edit => {
+            replace::edit_in_editor()?;
+            print_restart_hint();
             Ok(())
         }
     }

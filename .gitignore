@@ -15,3 +15,7 @@ Cargo.lock.orig
 .idea/
 *.swp
 .DS_Store
+
+# Build artifacts (local `cargo deb` output — release artifacts are built by CI)
+*.deb
+*.deb.sha256

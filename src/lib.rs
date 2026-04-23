@@ -6,6 +6,8 @@ pub mod hotkey;
 pub mod inject;
 pub mod model_download;
 pub mod postprocess;
+pub mod preroll;
+pub mod replace;
 pub mod stt;
 pub mod tray;
 pub mod update;

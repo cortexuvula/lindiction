@@ -9,19 +9,21 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 // the transcription worker in app.rs.
 pub struct SttEngine {
     ctx: WhisperContext,
+    beam_size: i32,
+    initial_prompt: String,
 }
 
 impl SttEngine {
-    pub fn load(model_path: &Path) -> Result<Self> {
+    pub fn load(model_path: &Path, beam_size: u32, initial_prompt: String) -> Result<Self> {
         if !model_path.exists() {
             anyhow::bail!(
                 "Model not found: {}. Download with:\n  \
-                 curl -L -o models/ggml-tiny.en.bin \
-                 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+                 curl -L -o ~/.local/share/lindiction/models/ggml-small.en.bin \
+                 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
                 model_path.display()
             );
         }
-        info!(path = %model_path.display(), "loading whisper model");
+        info!(path = %model_path.display(), beam_size, prompt_len = initial_prompt.len(), "loading whisper model");
         let ctx = WhisperContext::new_with_params(
             model_path
                 .to_str()
@@ -34,7 +36,15 @@ impl SttEngine {
                 model_path.display()
             )
         })?;
-        Ok(Self { ctx })
+        // Clamp to i32 to match whisper-rs's c_int; 1 floor avoids the
+        // pathological "beam_size = 0" configuration that would return
+        // no tokens at all.
+        let beam_size = beam_size.clamp(1, i32::MAX as u32) as i32;
+        Ok(Self {
+            ctx,
+            beam_size,
+            initial_prompt,
+        })
     }
 
     /// Transcribe a 16 kHz mono f32 buffer. Blocking; call from `spawn_blocking`.
@@ -47,15 +57,51 @@ impl SttEngine {
         // persistent WhisperState would be better for a future streaming mode.
         let mut state = self.ctx.create_state().context("creating whisper state")?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        // FIXME(v0.2): language is hardcoded for the English-only tiny.en model.
-        // A multilingual model (ggml-tiny.bin, ggml-base.bin, etc.) would ignore
-        // the speaker's actual language. Move to Config when we ship a config file.
+        let strategy = if self.beam_size > 1 {
+            SamplingStrategy::BeamSearch {
+                beam_size: self.beam_size,
+                // whisper.cpp currently ignores `patience`; 1.0 is the
+                // conventional "no adjustment" value.
+                patience: 1.0,
+            }
+        } else {
+            SamplingStrategy::Greedy { best_of: 1 }
+        };
+        let mut params = FullParams::new(strategy);
+        // Hardcoded to English — the default small.en model is English-only.
+        // Switching to a multilingual model (ggml-small.bin, etc.) without
+        // removing this would force transcription to English regardless of
+        // what language was spoken.
         params.set_language(Some("en"));
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        // Suppress "..." / "[ ]" hallucinations whisper otherwise emits on
+        // silence or noise.
+        params.set_suppress_blank(true);
+        params.set_suppress_non_speech_tokens(true);
+        // Threshold above which whisper declares a segment to be non-speech
+        // and emits nothing. 0.6 is the whisper.cpp default but setting
+        // explicitly guards against upstream default drift.
+        params.set_no_speech_thold(0.6);
+        // Each utterance is a fresh create_state()+full() call, so there's
+        // no between-utterance context leak to worry about. But *inside*
+        // one call, whisper segments audio longer than ~30 s and by default
+        // feeds the previous segment's tokens back in as context — which
+        // can compound errors on the second half of a long dictation.
+        // Disabling it makes each internal segment a clean slate.
+        params.set_no_context(true);
+        // Deterministic decoding. For beam search this matters only when
+        // whisper falls back from beam → sampling on low-confidence
+        // segments; 0.0 says "stick with the most probable token" on that
+        // fallback too. For greedy (beam_size=1) it's the default.
+        params.set_temperature(0.0);
+        // Empty initial_prompt means "no bias" — skip the call rather than
+        // pushing an empty string through FFI.
+        if !self.initial_prompt.is_empty() {
+            params.set_initial_prompt(&self.initial_prompt);
+        }
 
         state
             .full(params, audio)

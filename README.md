@@ -22,7 +22,7 @@ wget https://github.com/cortexuvula/lindiction/releases/latest/download/lindicti
 sudo apt install ./lindiction-v0.3.0-amd64.deb
 ```
 
-First run will auto-download the default tiny.en whisper model (~77 MB) to `~/.local/share/lindiction/models/` — expect a one-time ~20-second delay on initial launch.
+First run will auto-download the default small.en whisper model (~488 MB) to `~/.local/share/lindiction/models/` — expect a one-time delay of ~30 s to a few minutes depending on your connection.
 
 ### From source
 
@@ -69,6 +69,12 @@ Press Ctrl+C in the daemon terminal to exit.
 | `lindiction autostart enable` | Enable auto-start on graphical login (systemd `--user` unit). |
 | `lindiction autostart disable` | Disable auto-start on login. |
 | `lindiction autostart status` | Print the current enabled/disabled state. |
+| `lindiction replace add <from> <to>` | Add (or update) a word-fix entry. Case-insensitive `from` match. |
+| `lindiction replace list` | Print all configured replacements. |
+| `lindiction replace remove <from>` | Remove an entry. |
+| `lindiction replace edit` | Open `config.toml` in `$EDITOR` for free-form editing. |
+
+The `replace` family edits `~/.config/lindiction/config.toml` in place, preserving comments and formatting. After any change, restart the daemon (`systemctl --user restart lindiction`) to apply.
 
 ### Tray menu
 
@@ -149,7 +155,7 @@ systemctl --user disable --now lindiction
 
 Lindiction reads an optional TOML file at `~/.config/lindiction/config.toml` (or `$XDG_CONFIG_HOME/lindiction/config.toml`). If the file is absent, the built-in defaults apply. Unknown fields are rejected at startup.
 
-Precedence for the model path: `--model` CLI flag > `LINDICTION_MODEL` env var > `[model].path` in TOML > default (`models/ggml-tiny.en.bin`).
+Precedence for the model path: `--model` CLI flag > `LINDICTION_MODEL` env var > `[model].path` in TOML > default (`~/.local/share/lindiction/models/ggml-small.en.bin`).
 
 ### Full schema with defaults
 
@@ -162,9 +168,45 @@ Precedence for the model path: `--model` CLI flag > `LINDICTION_MODEL` env var >
 #       (up, down, left, right).
 binding = "ctrl+alt+space"
 
+[audio]
+# Milliseconds of mic audio captured *before* the hotkey press to
+# prepend to each utterance. Covers human reaction time between
+# "start speaking" and "hotkey registered" — without it, the first
+# phoneme of most utterances gets clipped. 0 disables.
+preroll_ms = 300
+
 [model]
 # Path to GGML whisper model file.
-path = "models/ggml-tiny.en.bin"
+path = "~/.local/share/lindiction/models/ggml-small.en.bin"
+
+[stt]
+# 1 = greedy (fastest); 5 = beam search (better accuracy, ~1.5-2x slower).
+beam_size = 5
+# Text primed into the decoder's context before each utterance.
+# Use this to bias recognition toward names, jargon, and acronyms
+# whisper would otherwise mishear. Empty disables. Keep short
+# (~200 chars max).
+# Example: "Andre, Claude, lindiction, Rust, tokio, Ubuntu."
+initial_prompt = ""
+
+[injection]
+# "type" = per-character xdotool typing. Universal (works everywhere)
+#          but some X setups silently drop keystrokes — usually spaces
+#          — producing merged words like "atesttosee".
+# "paste" = put text on clipboard (via xclip) and send paste_shortcut.
+#           Atomic, fast, reliable, but clobbers the clipboard.
+#           Requires `sudo apt install xclip`.
+method = "type"
+# Milliseconds between keystrokes when method = "type". Too low (below
+# ~10) and the X server silently drops events. Raise to 25-30 on busy
+# desktops. Ignored when method = "paste".
+xdotool_delay_ms = 15
+# Key combo sent when method = "paste". "ctrl+v" works for most GUI apps.
+# Terminal emulators (gnome-terminal, konsole, alacritty, etc.) need
+# "ctrl+shift+v". "shift+Insert" is a good X11-wide fallback. Passed
+# verbatim to `xdotool key` — capitalize keysyms as xdotool expects
+# (e.g. "Insert", "Return").
+paste_shortcut = "ctrl+v"
 
 [postprocess]
 # Remove common filler words before injection (case-insensitive, word-boundary).
@@ -177,6 +219,15 @@ capitalize_sentences = true
 
 # Append a `.` if the final character is not `.`, `?`, or `!`.
 ensure_trailing_period = true
+
+# Ordered [from, to] string pairs. Each `from` is matched case-insensitively
+# with word boundaries (where possible — edges that aren't word chars, like
+# "c++", get a one-sided boundary). Replacement is verbatim — spell the `to`
+# exactly how you want it to appear. Runs after sentence-capitalize so your
+# casing sticks even at sentence start. Later entries see earlier
+# substitutions, so you can chain:
+#   replacements = [["cloud", "Claude"], ["Claude code", "Claude Code"]]
+replacements = []
 
 [update]
 # Check GitHub for new releases and badge the tray icon when found.
@@ -233,14 +284,18 @@ No other breaking changes. Hotkey config, postprocess config, all existing TOML 
 
 **Text appears in the wrong window** — `xdotool type` types into the currently-focused window. Focus the target window before releasing the hotkey.
 
-**Transcriptions are gibberish** — the `tiny.en` model is fast but imprecise. Switch to `ggml-base.en.bin` via `--model`.
+**Transcriptions are inaccurate on proper nouns / jargon** — set `[stt].initial_prompt` in your config to a short comma-separated list of names and terms you dictate often (e.g. `"Andre, lindiction, tokio, Ubuntu"`). For further accuracy, upgrade to `ggml-medium.en.bin` (~1.5 GB) via `--model`; the default `small.en` already balances accuracy and latency well.
+
+**First phoneme of each utterance is missing** — your `[audio].preroll_ms` is 0 or too low. Increase to 400–500 ms. This compensates for reaction time between starting to speak and the hotkey registering.
+
+**Words appear glued together with spaces missing** (e.g. "atesttosee" instead of "a test to see") — `xdotool type` is dropping space keystrokes, *not* a whisper problem. Check the daemon log — if the `injecting text=…` line shows correct spaces but the typed output doesn't, first try raising `[injection].xdotool_delay_ms` to 25 or 30. If that still doesn't fix it (some xdotool builds are structurally unreliable), switch to clipboard paste: `sudo apt install xclip` and set `[injection].method = "paste"` in your config. Paste is atomic (one Ctrl+V), unaffected by per-character dropouts — but it clobbers your clipboard and won't work in terminals.
 
 **"curl exited with…" on first run** — the auto-download failed. Check your network, then relaunch. The partial download is automatically cleaned up. As a manual fallback:
 
 ```bash
 mkdir -p ~/.local/share/lindiction/models
-curl -L -o ~/.local/share/lindiction/models/ggml-tiny.en.bin \
-    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+curl -L -o ~/.local/share/lindiction/models/ggml-small.en.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
 ```
 
 **Tray icon doesn't appear** — on Ubuntu 24.04 GNOME, the AppIndicator extension is pre-installed and active. On vanilla upstream GNOME, install and enable it:
@@ -262,7 +317,7 @@ cargo test --lib
 
 ```bash
 # Integration test (requires a downloaded model)
-LINDICTION_MODEL=models/ggml-tiny.en.bin cargo test --test integration_stt -- --nocapture
+LINDICTION_MODEL=~/.local/share/lindiction/models/ggml-small.en.bin cargo test --test integration_stt -- --nocapture
 ```
 
 ## License

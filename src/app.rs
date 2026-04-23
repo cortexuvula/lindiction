@@ -1,9 +1,10 @@
 use crate::audio::{start_capture, AudioStream};
-use crate::config::Config;
+use crate::config::{Config, InjectionMethod};
 use crate::hotkey::{parse_binding, start as start_hotkey, HotkeyEvent, HotkeyListener};
 use crate::inject::Injector;
 use crate::model_download;
 use crate::postprocess::Postprocessor;
+use crate::preroll::PreRoll;
 use crate::stt::SttEngine;
 use crate::tray::{ControlCmd, TrayEvent, TrayManager};
 use crate::update::{self, UpdateInfo};
@@ -69,12 +70,25 @@ pub struct App;
 
 impl App {
     pub async fn run(config: Config) -> Result<ExitAction> {
-        // Preflight: verify xdotool is present before we accept any audio.
+        // Preflight: verify injection-method dependencies before we
+        // accept any audio. Both methods drive Ctrl+V / keystrokes via
+        // xdotool, so xdotool is always required; paste additionally
+        // needs xclip.
         if which::which("xdotool").is_err() {
             anyhow::bail!("xdotool not found on PATH. Install: sudo apt install xdotool");
         }
+        if config.injection.method == InjectionMethod::Paste && which::which("xclip").is_err() {
+            anyhow::bail!(
+                "injection.method = \"paste\" but xclip is not on PATH. \
+                 Install: sudo apt install xclip"
+            );
+        }
 
-        let injector = Injector::new(config.xdotool_delay_ms);
+        let injector = Injector::new(
+            config.injection.method,
+            config.injection.xdotool_delay_ms,
+            config.injection.paste_shortcut.clone(),
+        );
         let postprocessor = Postprocessor::new(&config.postprocess)
             .context("building postprocessor from config.postprocess")?;
 
@@ -139,8 +153,12 @@ impl App {
 
         // Load the model upfront — fail fast on a bad model path or corrupt file.
         let stt = Arc::new(
-            SttEngine::load(&config.model.path)
-                .with_context(|| format!("loading model from {}", config.model.path.display()))?,
+            SttEngine::load(
+                &config.model.path,
+                config.stt.beam_size,
+                config.stt.initial_prompt.clone(),
+            )
+            .with_context(|| format!("loading model from {}", config.model.path.display()))?,
         );
 
         // Transcription worker task: reads audio buffers from an mpsc channel
@@ -240,6 +258,16 @@ impl App {
         // accumulates ~19 MB; a 30-minute stuck-hotkey scenario is 115 MB.
         // Consider a max-samples cap that auto-releases with a warn.
         let mut buffer: Vec<f32> = Vec::with_capacity(16_000 * 30);
+        // Ring buffer over the last `preroll_ms` of mic audio. The audio
+        // select arm feeds this continuously while idle so that on hotkey
+        // press we can prepend recent samples to `buffer` — recovering the
+        // first phoneme most users start saying *before* the key fully
+        // registers. Set preroll_ms = 0 in config to disable; the ring
+        // then no-ops and the old "discard pre-press audio" behavior is
+        // effectively restored.
+        let preroll_samples =
+            (config.audio.preroll_ms as usize).saturating_mul(config.sample_rate as usize) / 1000;
+        let mut preroll = PreRoll::new(preroll_samples);
 
         loop {
             tokio::select! {
@@ -250,23 +278,19 @@ impl App {
                         } else if recording {
                             debug!("duplicate press ignored");
                         } else {
-                            // Discard any audio buffered in the channel from before the press.
-                            // cpal streams continuously from startup, so chunks pile up in the
-                            // unbounded mpsc while `recording` is false (the `if recording`
-                            // guard on the audio select arm only stops polling, not production).
-                            // Without this drain, every utterance would include all mic input
-                            // captured since daemon start (or the previous release), inflating
-                            // inference time and potentially capturing unrelated speech.
-                            let mut discarded = 0usize;
-                            while audio_rx.try_recv().is_ok() {
-                                discarded += 1;
-                            }
-                            if discarded > 0 {
-                                debug!(chunks = discarded, "discarded pre-press audio");
-                            }
-                            recording = true;
+                            // The audio arm is now unguarded and continuously
+                            // routes chunks into `preroll` while idle. On press
+                            // we drain that ring into the empty utterance buffer
+                            // so the first ~preroll_ms of audio before the press
+                            // gets transcribed too — this is what recovers the
+                            // clipped first phoneme.
                             buffer.clear();
-                            info!("recording started");
+                            preroll.drain_into(&mut buffer);
+                            recording = true;
+                            info!(
+                                preroll_samples = buffer.len(),
+                                "recording started"
+                            );
                             tray.set_state(TrayEvent::Recording);
                         }
                     }
@@ -277,6 +301,20 @@ impl App {
                             debug!("release without prior press ignored");
                         } else {
                             recording = false;
+                            // Flush any in-flight audio chunks from the mpsc
+                            // channel into the utterance buffer. Without this,
+                            // the same chunks would fall through to the audio
+                            // arm after `recording = false` and be routed to
+                            // the preroll ring, causing the tail of this
+                            // utterance to leak into the next press.
+                            while let Ok(chunk) = audio_rx.try_recv() {
+                                buffer.extend_from_slice(&chunk);
+                            }
+                            // Zero the ring so the first press after this
+                            // release sees only genuinely-fresh pre-press
+                            // audio, not a mix that might include earlier
+                            // utterance tail.
+                            preroll.clear();
                             let audio = std::mem::take(&mut buffer);
                             buffer.reserve(16_000 * 30); // restore capacity for the next utterance
                             let seconds = audio.len() as f32 / 16_000.0;
@@ -302,8 +340,23 @@ impl App {
                         break;
                     }
                 },
-                maybe_chunk = audio_rx.recv(), if recording => match maybe_chunk {
-                    Some(chunk) => buffer.extend_from_slice(&chunk),
+                maybe_chunk = audio_rx.recv() => match maybe_chunk {
+                    Some(chunk) => {
+                        // cpal runs continuously; we always consume to keep
+                        // the unbounded mpsc drained. Route each chunk based
+                        // on whether we're in an utterance:
+                        //   - recording: append to the utterance buffer
+                        //   - idle (or paused): push into the preroll ring,
+                        //     which silently evicts oldest samples
+                        if recording {
+                            buffer.extend_from_slice(&chunk);
+                        } else if !paused {
+                            preroll.push(&chunk);
+                        }
+                        // paused + !recording: drop the chunk. Pause means
+                        // "no audio retained" — allowing the ring to fill
+                        // would leak pre-resume audio into the next press.
+                    }
                     None => {
                         error!("audio channel closed; shutting down");
                         break;
@@ -375,6 +428,10 @@ impl App {
                                 buffer.clear();
                                 warn!("paused mid-recording; discarding utterance");
                             }
+                            // Same reasoning for the preroll ring: whatever we
+                            // had buffered at pause time was pre-pause audio the
+                            // user now expects forgotten.
+                            preroll.clear();
                             info!("paused");
                             tray.set_state(TrayEvent::Paused);
                         } else {

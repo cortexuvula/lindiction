@@ -10,6 +10,9 @@ pub struct Postprocessor {
     leading_stranded_punct: Regex,
     capitalize_sentences: bool,
     ensure_trailing_period: bool,
+    /// User-defined [from, to] replacements. Precompiled at construction
+    /// so apply() stays cheap.
+    replacements: Vec<(Regex, String)>,
 }
 
 impl Postprocessor {
@@ -33,6 +36,31 @@ impl Postprocessor {
         let collapse_whitespace = Regex::new(r"\s+").expect("static regex compiles");
         let space_before_terminal_punct = Regex::new(r"\s+([.?!])").expect("static regex compiles");
         let leading_stranded_punct = Regex::new(r"^[\s,;:]+").expect("static regex compiles");
+
+        // Compile each user replacement to a case-insensitive regex.
+        // Word boundaries are added only on edges that are actually word
+        // characters — so "clod" → \bclod\b (no match inside
+        // "clodhopper"), but "c++" → \bc\+\+ (no trailing \b, which
+        // would never match after `+`). Empty `from` entries are silently
+        // skipped: a `\b\b` regex matches every word boundary and would
+        // turn the transcript into a wall of `to`s.
+        let mut replacements: Vec<(Regex, String)> = Vec::with_capacity(cfg.replacements.len());
+        for pair in &cfg.replacements {
+            let from = pair[0].trim();
+            if from.is_empty() {
+                continue;
+            }
+            let escaped = regex::escape(from);
+            let first = from.chars().next().expect("non-empty");
+            let last = from.chars().last().expect("non-empty");
+            let lead = if is_word_char(first) { "\\b" } else { "" };
+            let trail = if is_word_char(last) { "\\b" } else { "" };
+            let pattern = format!("(?i){}{}{}", lead, escaped, trail);
+            let re = Regex::new(&pattern)
+                .with_context(|| format!("compiling replacement regex for `{}`", from))?;
+            replacements.push((re, pair[1].clone()));
+        }
+
         Ok(Self {
             filler_regex,
             collapse_whitespace,
@@ -40,6 +68,7 @@ impl Postprocessor {
             leading_stranded_punct,
             capitalize_sentences: cfg.capitalize_sentences,
             ensure_trailing_period: cfg.ensure_trailing_period,
+            replacements,
         })
     }
 
@@ -75,6 +104,16 @@ impl Postprocessor {
             s = capitalize_sentences(&s);
         }
 
+        // 4b. Apply user replacements (case-insensitive, word-bounded).
+        // Runs after capitalization so the replacement's casing is what
+        // the user wrote in config — e.g. "clod" → "Claude" keeps the
+        // capital C even at sentence start. Runs before trailing-period
+        // so replacements that add/remove punctuation don't desync the
+        // terminal-period check.
+        for (re, to) in &self.replacements {
+            s = re.replace_all(&s, to.as_str()).to_string();
+        }
+
         // 5. Append trailing period if none of `. ? !` terminate.
         if self.ensure_trailing_period && !s.is_empty() {
             let last = s.chars().last().expect("non-empty");
@@ -85,6 +124,12 @@ impl Postprocessor {
 
         s
     }
+}
+
+/// `\b` in the regex crate matches between `\w` and `\W`, where `\w`
+/// is ASCII `[A-Za-z0-9_]`. Mirror that exactly.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 fn capitalize_sentences(s: &str) -> String {
@@ -123,6 +168,7 @@ mod tests {
             filler_words: vec![],
             capitalize_sentences: false,
             ensure_trailing_period: false,
+            replacements: vec![],
         }
     }
 
@@ -212,6 +258,7 @@ mod tests {
             ],
             capitalize_sentences: true,
             ensure_trailing_period: true,
+            replacements: vec![],
         };
         let p = Postprocessor::new(&cfg).unwrap();
         // Regex must not treat the empty/whitespace entries as matches.
@@ -248,6 +295,7 @@ mod tests {
             filler_words: vec![],
             capitalize_sentences: true,
             ensure_trailing_period: true,
+            replacements: vec![],
         };
         let p = Postprocessor::new(&cfg).unwrap();
         // Note: without leading-punct stripping, the comma stays,
@@ -255,6 +303,84 @@ mod tests {
         // However `leading_stranded_punct` IS applied regardless
         // of `remove_fillers`, so the comma gets stripped here too.
         assert_eq!(p.apply(", hello world"), "Hello world.");
+    }
+
+    fn cfg_with_replacements(pairs: &[(&str, &str)]) -> PostprocessConfig {
+        PostprocessConfig {
+            replacements: pairs
+                .iter()
+                .map(|(a, b)| [a.to_string(), b.to_string()])
+                .collect(),
+            ..PostprocessConfig::default()
+        }
+    }
+
+    #[test]
+    fn replacement_simple_word() {
+        let p = Postprocessor::new(&cfg_with_replacements(&[("clod", "Claude")])).unwrap();
+        assert_eq!(p.apply("ask clod to help"), "Ask Claude to help.");
+    }
+
+    #[test]
+    fn replacement_is_case_insensitive_but_preserves_target_casing() {
+        let p = Postprocessor::new(&cfg_with_replacements(&[("clod", "Claude")])).unwrap();
+        // Matches "Clod" (capitalized by sentence-cap step) AND "CLOD",
+        // but the output is always the verbatim "Claude" from config.
+        assert_eq!(p.apply("clod says hi"), "Claude says hi.");
+        assert_eq!(p.apply("CLOD says hi"), "Claude says hi.");
+    }
+
+    #[test]
+    fn replacement_respects_word_boundary() {
+        // "clod" should match the standalone word but not occurrences
+        // inside longer words like "clodhopper".
+        let p = Postprocessor::new(&cfg_with_replacements(&[("clod", "Claude")])).unwrap();
+        assert_eq!(p.apply("clodhopper shoes"), "Clodhopper shoes.");
+    }
+
+    #[test]
+    fn replacement_handles_multi_word_from() {
+        let p =
+            Postprocessor::new(&cfg_with_replacements(&[("lin dictation", "lindiction")])).unwrap();
+        assert_eq!(p.apply("lin dictation is great"), "lindiction is great.");
+    }
+
+    #[test]
+    fn replacement_escapes_regex_metachars_in_from() {
+        // "c++" would otherwise be a regex error (unmatched quantifier).
+        let p = Postprocessor::new(&cfg_with_replacements(&[("c++", "cpp")])).unwrap();
+        assert_eq!(p.apply("i write c++ code"), "I write cpp code.");
+    }
+
+    #[test]
+    fn replacement_empty_from_is_skipped() {
+        // An empty `from` would compile to \b\b and match every word
+        // boundary; we silently ignore those entries instead.
+        let p = Postprocessor::new(&cfg_with_replacements(&[
+            ("", "nope"),
+            ("   ", "nope"),
+            ("clod", "Claude"),
+        ]))
+        .unwrap();
+        assert_eq!(p.apply("hello clod world"), "Hello Claude world.");
+    }
+
+    #[test]
+    fn replacement_runs_in_order_with_chaining() {
+        // Second replacement operates on the output of the first —
+        // documented behavior.
+        let p = Postprocessor::new(&cfg_with_replacements(&[
+            ("alpha", "beta"),
+            ("beta", "gamma"),
+        ]))
+        .unwrap();
+        assert_eq!(p.apply("one alpha two"), "One gamma two.");
+    }
+
+    #[test]
+    fn replacement_disabled_by_default() {
+        let p = Postprocessor::new(&PostprocessConfig::default()).unwrap();
+        assert_eq!(p.apply("clod says hi"), "Clod says hi.");
     }
 
     #[test]
@@ -266,6 +392,7 @@ mod tests {
             filler_words: vec![],
             capitalize_sentences: false,
             ensure_trailing_period: false,
+            replacements: vec![],
         };
         let p = Postprocessor::new(&cfg).unwrap();
         // leading_stranded_punct DOES fire even in raw mode — it's part

@@ -33,7 +33,7 @@ fn transcribes_hello_world_fixture() {
         return;
     }
 
-    let engine = SttEngine::load(&model).expect("load model");
+    let engine = SttEngine::load(&model, 5, String::new()).expect("load model");
     let audio = load_wav("tests/fixtures/hello.wav");
     let text = engine.transcribe(&audio).expect("transcribe");
     let lc = text.to_lowercase();

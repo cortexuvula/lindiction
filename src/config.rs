@@ -3,8 +3,8 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
-/// Resolve the default model path to `$XDG_DATA_HOME/lindiction/models/ggml-tiny.en.bin`
-/// (typically `~/.local/share/lindiction/models/ggml-tiny.en.bin`).
+/// Resolve the default model path to `$XDG_DATA_HOME/lindiction/models/ggml-small.en.bin`
+/// (typically `~/.local/share/lindiction/models/ggml-small.en.bin`).
 ///
 /// This is the single source of truth for the default — consumed by
 /// `ModelConfig::default` AND by `model_download::ensure_default_model`
@@ -14,7 +14,7 @@ pub fn default_model_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".local/share"))
         .join("lindiction")
         .join("models")
-        .join("ggml-tiny.en.bin")
+        .join("ggml-small.en.bin")
 }
 
 /// Path to the TOML config file: `$XDG_CONFIG_HOME/lindiction/config.toml`
@@ -29,15 +29,16 @@ pub fn config_file_path() -> Option<PathBuf> {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub hotkey: HotkeyConfig,
+    pub audio: AudioConfig,
     pub model: ModelConfig,
+    pub stt: SttConfig,
+    pub injection: InjectionConfig,
     pub postprocess: PostprocessConfig,
     pub update: UpdateConfig,
     #[serde(skip)]
     pub sample_rate: u32,
     #[serde(skip)]
     pub channels: u16,
-    #[serde(skip)]
-    pub xdotool_delay_ms: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,11 +55,78 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct AudioConfig {
+    /// Milliseconds of mic audio captured *before* the hotkey press to
+    /// prepend to each utterance. Set to 0 to disable. Default 300 ms
+    /// is enough to cover typical reaction time between the user
+    /// starting to speak and the hotkey actually registering.
+    pub preroll_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InjectionMethod {
+    /// Use `xdotool type` to emit one keystroke per character. Simple,
+    /// works in every app (including terminals), but the X server may
+    /// silently drop keystrokes on some systems — most often spaces.
+    Type,
+    /// Put the transcription on the clipboard via `xclip`, then send a
+    /// single `Ctrl+V`. Atomic, fast, unaffected by per-keystroke
+    /// dropouts. Does not work in terminals (they use Ctrl+Shift+V)
+    /// and clobbers the user's clipboard.
+    Paste,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InjectionConfig {
+    /// `"type"` = per-character xdotool typing (default, universal but
+    /// fragile). `"paste"` = clipboard + paste shortcut (fast, reliable,
+    /// but clobbers the clipboard).
+    pub method: InjectionMethod,
+    /// Milliseconds between each keystroke `xdotool type` emits (only
+    /// used when `method = "type"`). Too low and the X server silently
+    /// drops events (usually space — producing merged words like
+    /// "atesttosee"). xdotool's own default is 12; we default a bit
+    /// higher for safety on busy desktops.
+    pub xdotool_delay_ms: u32,
+    /// Key combo sent via `xdotool key` when `method = "paste"`.
+    /// Defaults to `ctrl+v` (standard GUI paste). Terminal emulators
+    /// typically need `ctrl+shift+v`; `shift+Insert` is an X11-wide
+    /// fallback that pastes the primary selection. Whatever string you
+    /// set here is passed verbatim to `xdotool key`, so xdotool keysym
+    /// syntax applies (capitalized `Insert`, etc.).
+    pub paste_shortcut: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SttConfig {
+    /// 1 = greedy (fastest); 5 = beam search (better accuracy, ~1.5-2×
+    /// slower). Values >5 show diminishing returns.
+    pub beam_size: u32,
+    /// Text primed into the decoder's context before each utterance.
+    /// Use this to bias recognition toward proper nouns and jargon the
+    /// model wouldn't otherwise know (project names, coworker names,
+    /// acronyms). Empty string disables. Keep under ~200 chars —
+    /// whisper will truncate longer prompts.
+    pub initial_prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PostprocessConfig {
     pub remove_fillers: bool,
     pub filler_words: Vec<String>,
     pub capitalize_sentences: bool,
     pub ensure_trailing_period: bool,
+    /// Ordered list of [from, to] string pairs. Each `from` is matched
+    /// case-insensitively with word boundaries; on match, it's replaced
+    /// verbatim with `to` (preserving the `to` casing exactly — so spell
+    /// proper nouns the way you want them to appear). Applied after
+    /// filler removal and sentence-capitalization; runs in list order
+    /// so later entries see earlier substitutions.
+    pub replacements: Vec<[String; 2]>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +156,31 @@ impl Default for ModelConfig {
     }
 }
 
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self { preroll_ms: 300 }
+    }
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self {
+            method: InjectionMethod::Type,
+            xdotool_delay_ms: 15,
+            paste_shortcut: "ctrl+v".to_string(),
+        }
+    }
+}
+
+impl Default for SttConfig {
+    fn default() -> Self {
+        Self {
+            beam_size: 5,
+            initial_prompt: String::new(),
+        }
+    }
+}
+
 impl Default for PostprocessConfig {
     fn default() -> Self {
         Self {
@@ -98,6 +191,7 @@ impl Default for PostprocessConfig {
                 .collect(),
             capitalize_sentences: true,
             ensure_trailing_period: true,
+            replacements: Vec::new(),
         }
     }
 }
@@ -115,12 +209,14 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: HotkeyConfig::default(),
+            audio: AudioConfig::default(),
             model: ModelConfig::default(),
+            stt: SttConfig::default(),
+            injection: InjectionConfig::default(),
             postprocess: PostprocessConfig::default(),
             update: UpdateConfig::default(),
             sample_rate: 16_000,
             channels: 1,
-            xdotool_delay_ms: 5,
         }
     }
 }
@@ -185,10 +281,10 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.model.path, super::default_model_path());
         // Verify the helper returns an absolute path ending with
-        // lindiction/models/ggml-tiny.en.bin.
+        // lindiction/models/ggml-small.en.bin.
         let p = super::default_model_path();
         assert!(
-            p.ends_with("lindiction/models/ggml-tiny.en.bin"),
+            p.ends_with("lindiction/models/ggml-small.en.bin"),
             "got {}",
             p.display()
         );
@@ -207,6 +303,35 @@ mod tests {
         assert!(c.postprocess.capitalize_sentences);
         assert!(c.postprocess.ensure_trailing_period);
         assert!(!c.postprocess.filler_words.is_empty());
+    }
+
+    #[test]
+    fn default_audio_config() {
+        let c = Config::default();
+        assert_eq!(c.audio.preroll_ms, 300);
+    }
+
+    #[test]
+    fn default_stt_config() {
+        let c = Config::default();
+        assert_eq!(c.stt.beam_size, 5);
+        assert!(c.stt.initial_prompt.is_empty());
+    }
+
+    #[test]
+    fn audio_and_stt_sections_parse() {
+        let s = r#"
+[audio]
+preroll_ms = 500
+
+[stt]
+beam_size = 1
+initial_prompt = "Andre, lindiction, tokio"
+"#;
+        let c: Config = toml::from_str(s).expect("parse");
+        assert_eq!(c.audio.preroll_ms, 500);
+        assert_eq!(c.stt.beam_size, 1);
+        assert_eq!(c.stt.initial_prompt, "Andre, lindiction, tokio");
     }
 
     #[test]
@@ -233,7 +358,48 @@ interval_hours = 24
         let c = Config::default();
         assert_eq!(c.sample_rate, 16_000);
         assert_eq!(c.channels, 1);
-        assert_eq!(c.xdotool_delay_ms, 5);
+        assert_eq!(c.injection.xdotool_delay_ms, 15);
+    }
+
+    #[test]
+    fn postprocess_replacements_parse_and_default_empty() {
+        let c = Config::default();
+        assert!(c.postprocess.replacements.is_empty());
+
+        let s = r#"
+[postprocess]
+replacements = [["clod", "Claude"], ["lin dictation", "lindiction"]]
+"#;
+        let c: Config = toml::from_str(s).expect("parse");
+        assert_eq!(
+            c.postprocess.replacements,
+            vec![
+                ["clod".to_string(), "Claude".to_string()],
+                ["lin dictation".to_string(), "lindiction".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn injection_section_parses() {
+        let s = r#"
+[injection]
+method = "paste"
+xdotool_delay_ms = 25
+paste_shortcut = "ctrl+shift+v"
+"#;
+        let c: Config = toml::from_str(s).expect("parse");
+        assert_eq!(c.injection.method, InjectionMethod::Paste);
+        assert_eq!(c.injection.xdotool_delay_ms, 25);
+        assert_eq!(c.injection.paste_shortcut, "ctrl+shift+v");
+    }
+
+    #[test]
+    fn injection_defaults_match_expected() {
+        let c = Config::default();
+        assert_eq!(c.injection.method, InjectionMethod::Type);
+        assert_eq!(c.injection.xdotool_delay_ms, 15);
+        assert_eq!(c.injection.paste_shortcut, "ctrl+v");
     }
 
     #[test]
