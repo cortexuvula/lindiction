@@ -292,9 +292,22 @@ impl TrayManager {
         // not poisoned; subsequent handle.update() calls silently no-op.
         // Net effect: daemon continues working via hotkey even without a
         // tray icon, at the cost of a one-time stderr panic message.
+        //
+        // spawn_without_dbus_name() registers the item by the DBus unique
+        // connection name (e.g. ":1.268") instead of ksni's well-known
+        // "org.kde.StatusNotifierItem-{PID}-{COUNTER}". Critical for the
+        // tray "Restart" path: execve preserves PID and ksni's COUNTER is
+        // a process-local static that resets to 1 in the new image, so
+        // spawn() re-registers the identical well-known name the old
+        // instance just released. GNOME shell's appindicator watcher
+        // dedups against its stale entry (NameOwnerChanged hasn't been
+        // processed yet) and silently drops the new registration — icon
+        // never reappears, daemon still works. Unique-name registration
+        // sidesteps the collision entirely because DBus assigns a fresh
+        // unique name per connection.
         let service = ksni::TrayService::new(tray);
         let handle = service.handle();
-        service.spawn();
+        service.spawn_without_dbus_name();
 
         info!("tray service spawned");
 
