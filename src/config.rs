@@ -234,36 +234,75 @@ impl Config {
     /// auto-download for them.
     pub fn load(cli_model: Option<PathBuf>) -> Result<Self> {
         let mut config = Self::from_xdg_file()?;
+        // Probe hardware once up front. Used by precedence-4 auto-
+        // selection and by reconciliation logging at the end. Calling
+        // `hw_detect::detect()` is cheap (a few subprocess spawns at
+        // most) but still wasteful to repeat.
+        let hw = hw_detect::detect();
 
-        // Precedence 1: CLI.
+        // Resolve model path by precedence. Only precedence 4 sets
+        // `auto_selected_model`; the first three are explicit user
+        // choices and `model_download::ensure_model` skips auto-download
+        // for them.
         if let Some(p) = cli_model {
+            // Precedence 1: CLI.
             config.model.path = p;
             config.auto_selected_model = None;
-            return Ok(config);
-        }
-        // Precedence 2: env var.
-        if let Ok(p) = std::env::var("LINDICTION_MODEL") {
+        } else if let Ok(p) = std::env::var("LINDICTION_MODEL") {
+            // Precedence 2: env var. An empty env var falls through.
             if !p.is_empty() {
                 config.model.path = PathBuf::from(p);
                 config.auto_selected_model = None;
-                return Ok(config);
             }
         }
-        // Precedence 3: TOML's explicit path (non-empty PathBuf).
-        if !config.model.path.as_os_str().is_empty() {
-            config.auto_selected_model = None;
-            return Ok(config);
+        // Precedence 3 (TOML explicit path) is already reflected in
+        // `config.model.path` from `from_xdg_file`. Precedence 4: if
+        // nothing above set a path, fall back to hardware auto-select.
+        if config.model.path.as_os_str().is_empty() {
+            let chosen = model_choice::recommend(&hw);
+            info!(
+                profile = ?hw,
+                chosen = chosen.tag(),
+                "auto-selected whisper model based on hardware"
+            );
+            config.model.path = model_download::default_model_path_for(chosen);
+            config.auto_selected_model = Some(chosen);
         }
-        // Precedence 4: hardware auto-selection.
-        let hw = hw_detect::detect();
-        let chosen = model_choice::recommend(&hw);
-        info!(
-            profile = ?hw,
-            chosen = chosen.tag(),
-            "auto-selected whisper model based on hardware"
-        );
-        config.model.path = model_download::default_model_path_for(chosen);
-        config.auto_selected_model = Some(chosen);
+
+        // Log reconciliation regardless of how model path was resolved —
+        // a user who set --model explicitly still benefits from knowing
+        // whether their compiled backend matches their hardware.
+        match crate::reconcile_backend(&hw) {
+            crate::BackendReconciliation::CpuBuildNoGpu => {
+                debug!(
+                    backend = crate::COMPILED_BACKEND,
+                    "cpu build on cpu host — nothing to reconcile"
+                );
+            }
+            crate::BackendReconciliation::GpuBuildMatchesGpu => {
+                info!(
+                    backend = crate::COMPILED_BACKEND,
+                    "gpu build matches detected gpu"
+                );
+            }
+            crate::BackendReconciliation::CpuBuildWithGpu => {
+                warn!(
+                    detected = ?hw.gpu,
+                    "running on cpu-only build but a gpu was detected; \
+                     rebuild with `cargo build --release --features cuda` (or vulkan / hipblas) \
+                     to use the gpu"
+                );
+            }
+            crate::BackendReconciliation::GpuBuildWithoutMatchingGpu => {
+                warn!(
+                    compiled = crate::COMPILED_BACKEND,
+                    detected = ?hw.gpu,
+                    "binary was built for a gpu backend that doesn't match the detected hardware; \
+                     the daemon will still run but GPU is unused. Rebuild with the matching feature flag."
+                );
+            }
+        }
+
         Ok(config)
     }
 
