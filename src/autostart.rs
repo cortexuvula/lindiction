@@ -238,6 +238,19 @@ fn user_unit_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("systemd").join("user").join(UNIT_NAME))
 }
 
+/// Quote and escape a path for systemd's `ExecStart=`. Systemd's double-quoted
+/// form recognizes POSIX shell escapes for `\\`, `\"`, `\$`, backtick, and
+/// newline inside the quotes; escaping backslashes and double-quotes covers
+/// every real-world path. Safe to call on plain paths with no special
+/// characters — wrapping them in quotes is still valid systemd syntax. Not
+/// idempotent though: the output is already quoted, so re-applying would
+/// produce `""…""`.
+fn escape_exec_path(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// Produce a systemd unit file targeting `exe`. Kept as a pure function so
 /// it's trivially unit-testable. Mirrors `systemd/lindiction.service` from
 /// the repo with the ExecStart substituted.
@@ -250,14 +263,14 @@ fn generate_unit_contents(exe: &std::path::Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe}\n\
+         ExecStart={exec_start}\n\
          Restart=on-failure\n\
          RestartSec=3\n\
          Environment=RUST_LOG=lindiction=info\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exe = exe.display()
+        exec_start = escape_exec_path(exe)
     )
 }
 
@@ -334,11 +347,38 @@ mod tests {
     #[test]
     fn generated_unit_contains_exe_path() {
         let contents = generate_unit_contents(Path::new("/home/alice/.cargo/bin/lindiction"));
-        assert!(contents.contains("ExecStart=/home/alice/.cargo/bin/lindiction\n"));
+        assert!(contents.contains("ExecStart=\"/home/alice/.cargo/bin/lindiction\"\n"));
         assert!(contents.contains("[Unit]"));
         assert!(contents.contains("[Service]"));
         assert!(contents.contains("[Install]"));
         assert!(contents.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn generated_unit_handles_path_with_spaces() {
+        let contents = generate_unit_contents(Path::new("/home/a b/bin/lindiction"));
+        assert!(
+            contents.contains("ExecStart=\"/home/a b/bin/lindiction\"\n"),
+            "ExecStart with spaces must be quoted; got:\n{contents}"
+        );
+    }
+
+    #[test]
+    fn generated_unit_escapes_embedded_quotes() {
+        let contents = generate_unit_contents(Path::new("/tmp/q\"uote/lindiction"));
+        assert!(
+            contents.contains("ExecStart=\"/tmp/q\\\"uote/lindiction\"\n"),
+            "embedded double-quote must be backslash-escaped inside the quoted value; got:\n{contents}"
+        );
+    }
+
+    #[test]
+    fn generated_unit_escapes_embedded_backslashes() {
+        let contents = generate_unit_contents(Path::new("/tmp/a\\b/lindiction"));
+        assert!(
+            contents.contains("ExecStart=\"/tmp/a\\\\b/lindiction\"\n"),
+            "embedded backslash must be doubled inside the quoted value; got:\n{contents}"
+        );
     }
 
     #[test]
