@@ -343,17 +343,6 @@ impl TrayManager {
         &mut self.control_rx
     }
 
-    /// Reflect the authoritative paused state back into the tray so the
-    /// Pause checkbox stays truthful even if, later, the app wants to
-    /// change paused state from somewhere other than a user click.
-    ///
-    /// Currently only used by App::run when it wants to force the tray's
-    /// local cache back in sync (e.g., after a no-op toggle). Keeps the
-    /// UI-cache-only invariant documented on LindictionTray honest.
-    pub fn set_paused(&self, paused: bool) {
-        self.handle.update(|t| t.paused = paused);
-    }
-
     /// Publish the result of an update check into the tray's UI state.
     /// `Some(v)` lights up the badge + "Update to vX.Y.Z…" menu item;
     /// `None` clears both. Called from the App after each check (startup,
