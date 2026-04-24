@@ -24,12 +24,18 @@ impl SttEngine {
             );
         }
         info!(path = %model_path.display(), beam_size, prompt_len = initial_prompt.len(), "loading whisper model");
-        // whisper-rs 0.16 exposes `use_gpu` on WhisperContextParameters and
-        // defaults may vary across point releases; pin to CPU-only here.
-        // GPU acceleration will be re-enabled behind Cargo features in a
-        // follow-up task.
+        // use_gpu is governed by COMPILED_BACKEND (set by the cuda / vulkan /
+        // hipblas Cargo features). A CPU-only build uses false; a GPU-feature
+        // build uses true and whisper.cpp picks the matching backend.
         let mut ctx_params = WhisperContextParameters::default();
-        ctx_params.use_gpu = false;
+        // use_gpu toggles whisper.cpp's GPU backend at runtime. It has effect
+        // only if a GPU backend was compiled into whisper-rs (via the cuda,
+        // vulkan, or hipblas feature). On a pure-CPU build, use_gpu=true is
+        // a no-op — whisper.cpp silently falls back to CPU since no backend
+        // was linked in. Keeping the flag driven by COMPILED_BACKEND rather
+        // than a runtime config option means the binary does the right thing
+        // without extra setup.
+        ctx_params.use_gpu = crate::COMPILED_BACKEND != "cpu";
         let ctx = WhisperContext::new_with_params(
             model_path
                 .to_str()

@@ -31,11 +31,26 @@ toml = "0.8"
 toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-whisper-rs = "0.16"
+whisper-rs = { version = "0.16", default-features = false }
 which = "6"
 
 [dev-dependencies]
 hound = "3.5"   # for reading WAV in integration tests
+
+[features]
+default = []
+# GPU backend features. Pick at most ONE — they're mutually exclusive at
+# the whisper.cpp level (build fails on conflicting backends). Pure-CPU
+# build uses the empty default feature set.
+#
+# cuda     — NVIDIA GPUs (Compute Capability 5.0+). Needs CUDA runtime
+#            on the target host.
+# vulkan   — Cross-vendor GPU via Vulkan. Needs libvulkan.so.1 (on every
+#            modern Linux). Typical for Intel Arc / AMD without ROCm.
+# hipblas  — AMD GPUs via ROCm. Needs ROCm runtime on the target host.
+cuda = ["whisper-rs/cuda"]
+vulkan = ["whisper-rs/vulkan"]
+hipblas = ["whisper-rs/hipblas"]
 
 [package.metadata.deb]
 maintainer = "Andre Hugo <cortexpeterpan@gmail.com>"

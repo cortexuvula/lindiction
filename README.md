@@ -43,6 +43,27 @@ cargo build --release
 
 First build takes several minutes (compiles whisper.cpp from source). First run auto-downloads the model; no manual `curl` step needed.
 
+## Building with GPU support
+
+Lindiction runs on CPU by default. To build with GPU acceleration, enable
+one of three mutually-exclusive Cargo features:
+
+```bash
+# NVIDIA (needs CUDA runtime on target host):
+cargo build --release --features cuda
+
+# Cross-vendor Vulkan (needs libvulkan.so.1 — present on every modern
+# Linux; covers Intel Arc, AMD without ROCm, NVIDIA as fallback):
+cargo build --release --features vulkan
+
+# AMD via ROCm:
+cargo build --release --features hipblas
+```
+
+Only one GPU feature can be enabled at a time — they conflict at the
+whisper.cpp level. The daemon logs the compiled backend at startup so
+you can verify which build you're running.
+
 ## Run
 
 ```bash
