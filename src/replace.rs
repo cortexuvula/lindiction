@@ -110,27 +110,42 @@ pub fn edit_in_editor() -> Result<()> {
         let doc = load_or_new(&path)?;
         save(&path, &doc)?;
     }
-    let editor = pick_editor();
-    let status = std::process::Command::new(&editor)
+    let argv = pick_editor_argv();
+    // argv is guaranteed non-empty by pick_editor_argv's contract
+    // (it always returns at least `vi`).
+    let (program, flags) = argv.split_first().expect("pick_editor_argv returns non-empty");
+    let status = std::process::Command::new(program)
+        .args(flags)
         .arg(&path)
         .status()
-        .with_context(|| format!("failed to spawn editor `{editor}`"))?;
+        .with_context(|| format!("failed to spawn editor `{program}`"))?;
     if !status.success() {
-        anyhow::bail!("editor `{editor}` exited with {status}");
+        anyhow::bail!("editor `{program}` exited with {status}");
     }
     Ok(())
 }
 
-fn pick_editor() -> String {
+/// Pick the editor to spawn, returning it as program + args.
+///
+/// Handles the common case of `EDITOR="code --wait"` / `EDITOR="nvim -u NONE"`
+/// where the env var holds more than just a program name. Without splitting,
+/// `Command::new("code --wait")` would fail with ENOENT (no such file).
+///
+/// Matches git / cargo / make semantics: naive whitespace split, no shell
+/// quoting support. `EDITOR='"my editor"'` with quoted-path-containing-spaces
+/// isn't handled — bringing in `shell_words` just for that would be overkill
+/// for a rare edge case no one has asked for.
+fn pick_editor_argv() -> Vec<String> {
     if let Ok(e) = std::env::var("EDITOR") {
-        if !e.trim().is_empty() {
-            return e;
+        let tokens: Vec<String> = e.split_whitespace().map(String::from).collect();
+        if !tokens.is_empty() {
+            return tokens;
         }
     }
     if which::which("nano").is_ok() {
-        return "nano".to_string();
+        return vec!["nano".to_string()];
     }
-    "vi".to_string()
+    vec!["vi".to_string()]
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -341,5 +356,68 @@ replacements = [["old", "new"]]
             assert!(after.contains("clod"));
             assert!(after.contains("binding = \"f9\""));
         });
+    }
+
+    #[test]
+    fn editor_argv_single_word() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("EDITOR", "vim");
+        assert_eq!(pick_editor_argv(), vec!["vim".to_string()]);
+        std::env::remove_var("EDITOR");
+    }
+
+    #[test]
+    fn editor_argv_splits_on_whitespace() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("EDITOR", "code --wait");
+        assert_eq!(
+            pick_editor_argv(),
+            vec!["code".to_string(), "--wait".to_string()]
+        );
+        std::env::remove_var("EDITOR");
+    }
+
+    #[test]
+    fn editor_argv_collapses_runs_of_whitespace() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("EDITOR", "  nvim    -u   NONE  ");
+        assert_eq!(
+            pick_editor_argv(),
+            vec!["nvim".to_string(), "-u".to_string(), "NONE".to_string()]
+        );
+        std::env::remove_var("EDITOR");
+    }
+
+    #[test]
+    fn editor_argv_empty_or_blank_env_falls_back() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // "" and "   " both should trigger the fallback, not an empty argv.
+        for blank in ["", "   ", "\t\n"] {
+            std::env::set_var("EDITOR", blank);
+            let argv = pick_editor_argv();
+            assert!(
+                !argv.is_empty(),
+                "argv must never be empty for EDITOR = {blank:?}"
+            );
+            let prog = argv.first().unwrap().as_str();
+            assert!(
+                prog == "nano" || prog == "vi",
+                "fallback should be nano or vi; got {prog} for EDITOR = {blank:?}"
+            );
+        }
+        std::env::remove_var("EDITOR");
+    }
+
+    #[test]
+    fn editor_argv_unset_env_falls_back() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("EDITOR");
+        let argv = pick_editor_argv();
+        assert!(!argv.is_empty());
+        let prog = argv.first().unwrap().as_str();
+        assert!(
+            prog == "nano" || prog == "vi",
+            "fallback should be nano or vi; got {prog}"
+        );
     }
 }
