@@ -3,7 +3,7 @@ use std::path::Path;
 use tracing::info;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-// whisper-rs 0.11 marks WhisperContext as both Send and Sync (see
+// whisper-rs marks WhisperContext as both Send and Sync (see
 // whisper_rs::whisper_ctx::{unsafe impl Send, unsafe impl Sync}). That makes
 // SttEngine itself Send + Sync, so Arc<SttEngine> is enough — no Mutex — for
 // the transcription worker in app.rs.
@@ -24,11 +24,17 @@ impl SttEngine {
             );
         }
         info!(path = %model_path.display(), beam_size, prompt_len = initial_prompt.len(), "loading whisper model");
+        // whisper-rs 0.16 exposes `use_gpu` on WhisperContextParameters and
+        // defaults may vary across point releases; pin to CPU-only here.
+        // GPU acceleration will be re-enabled behind Cargo features in a
+        // follow-up task.
+        let mut ctx_params = WhisperContextParameters::default();
+        ctx_params.use_gpu = false;
         let ctx = WhisperContext::new_with_params(
             model_path
                 .to_str()
                 .context("model path is not valid UTF-8")?,
-            WhisperContextParameters::default(),
+            ctx_params,
         )
         .with_context(|| {
             format!(
@@ -80,7 +86,8 @@ impl SttEngine {
         // Suppress "..." / "[ ]" hallucinations whisper otherwise emits on
         // silence or noise.
         params.set_suppress_blank(true);
-        params.set_suppress_non_speech_tokens(true);
+        // Renamed in whisper-rs 0.16: `set_suppress_non_speech_tokens` → `set_suppress_nst`.
+        params.set_suppress_nst(true);
         // Threshold above which whisper declares a segment to be non-speech
         // and emits nothing. 0.6 is the whisper.cpp default but setting
         // explicitly guards against upstream default drift.
@@ -107,10 +114,15 @@ impl SttEngine {
             .full(params, audio)
             .context("whisper inference failed")?;
 
-        let n = state.full_n_segments().context("segment count")?;
+        // In 0.16 `full_n_segments` returns `c_int` directly (not `Result`),
+        // and segment text is fetched via `get_segment(i).to_str()`.
+        let n = state.full_n_segments();
         let mut out = String::new();
         for i in 0..n {
-            out.push_str(&state.full_get_segment_text(i).context("segment text")?);
+            let seg = state
+                .get_segment(i)
+                .with_context(|| format!("segment {i} missing"))?;
+            out.push_str(seg.to_str().context("segment text")?);
         }
         let trimmed = out.trim();
         if is_non_speech_marker(trimmed) {
