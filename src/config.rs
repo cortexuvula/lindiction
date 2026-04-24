@@ -1,3 +1,4 @@
+use crate::model_choice::ModelId;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -39,6 +40,8 @@ pub struct Config {
     pub sample_rate: u32,
     #[serde(skip)]
     pub channels: u16,
+    #[serde(skip)]
+    pub auto_selected_model: Option<ModelId>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +220,7 @@ impl Default for Config {
             update: UpdateConfig::default(),
             sample_rate: 16_000,
             channels: 1,
+            auto_selected_model: None,
         }
     }
 }

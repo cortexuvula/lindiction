@@ -94,8 +94,8 @@ impl App {
 
         // Auto-download the default model on first run (no-op if the file
         // is already present or if the user specified a custom path).
-        model_download::ensure_default_model(&config.model.path)
-            .context("ensuring default whisper model is available")?;
+        model_download::ensure_model(&config.model.path, config.auto_selected_model)
+            .context("ensuring whisper model is available")?;
 
         let mut tray = TrayManager::start(config.update.enabled);
         tray.set_state(TrayEvent::Idle);
