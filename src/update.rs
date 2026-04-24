@@ -213,15 +213,85 @@ pub async fn install(info: &UpdateInfo) -> Result<()> {
     }
 }
 
+/// Temp directory guard. Creates the dir on construction, removes it on drop.
+/// Replaces the former make_tmp_dir + cleanup_tmp pair so every early-return
+/// via `?` in install_deb / install_tarball cleans up, not just the success
+/// path.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Result<Self> {
+        let p = std::env::temp_dir().join(format!("lindiction-update-{}", std::process::id()));
+        // Wipe any stale debris from a prior attempt so sha256sum -c can't
+        // "verify" the wrong file.
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
+        Ok(Self(p))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn join<P: AsRef<Path>>(&self, name: P) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                error = %e,
+                path = %self.0.display(),
+                "failed to clean up update temp dir"
+            ),
+        }
+    }
+}
+
+/// Staging-file guard. Removes the file on drop unless it has already been
+/// renamed elsewhere (in which case remove_file returns ENOENT, which we
+/// swallow). Used by the tarball install to clean up the
+/// `.lindiction-update-$PID.tmp` staging copy if any step after its
+/// creation fails before the atomic rename.
+struct StagingFile(PathBuf);
+
+impl StagingFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        // ENOENT is the normal success path (we renamed the file away).
+        // Anything else is best-effort cleanup gone wrong; worth a warn so
+        // the user can spot permission / FS errors instead of silently
+        // littering their install directory.
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                error = %e,
+                path = %self.0.display(),
+                "failed to clean up staging file"
+            ),
+        }
+    }
+}
+
 async fn install_deb(info: &UpdateInfo) -> Result<()> {
-    let tmp = make_tmp_dir()?;
+    let tmp = TempDir::new()?;
     let deb_filename = format!("lindiction-{}-amd64.deb", info.tag_name);
     let deb_path = tmp.join(&deb_filename);
     download(&info.deb_url, &deb_path).await?;
     if let Some(sha_url) = &info.deb_sha256_url {
         let sha_filename = format!("{deb_filename}.sha256");
         download(sha_url, &tmp.join(&sha_filename)).await?;
-        verify_sha256(&tmp, &sha_filename)?;
+        verify_sha256(tmp.path(), &sha_filename)?;
     } else {
         warn!(
             tag = %info.tag_name,
@@ -246,21 +316,20 @@ async fn install_deb(info: &UpdateInfo) -> Result<()> {
              apt lock held, or dependency conflict"
         ));
     }
-    cleanup_tmp(&tmp);
     Ok(())
 }
 
 async fn install_tarball(info: &UpdateInfo) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = make_tmp_dir()?;
+    let tmp = TempDir::new()?;
     let tarball_filename = format!("lindiction-{}-x86_64-linux.tar.gz", info.tag_name);
     let sha_filename = format!("{tarball_filename}.sha256");
     let tarball_path = tmp.join(&tarball_filename);
     let sha_path = tmp.join(&sha_filename);
     download(&info.tarball_url, &tarball_path).await?;
     download(&info.tarball_sha256_url, &sha_path).await?;
-    verify_sha256(&tmp, &sha_filename)?;
+    verify_sha256(tmp.path(), &sha_filename)?;
 
     // Extract. The release tarball is a flat archive containing only the
     // `lindiction` binary at its root.
@@ -268,7 +337,7 @@ async fn install_tarball(info: &UpdateInfo) -> Result<()> {
         .arg("-xzf")
         .arg(&tarball_path)
         .arg("-C")
-        .arg(&tmp)
+        .arg(tmp.path())
         .status()
         .await
         .context("spawning tar")?;
@@ -291,40 +360,23 @@ async fn install_tarball(info: &UpdateInfo) -> Result<()> {
     let parent = exe
         .parent()
         .ok_or_else(|| anyhow!("current binary {} has no parent directory", exe.display()))?;
-    let staging = parent.join(format!(".lindiction-update-{}.tmp", std::process::id()));
-    std::fs::copy(&extracted, &staging)
-        .with_context(|| format!("copying new binary to {}", staging.display()))?;
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("setting +x on {}", staging.display()))?;
+    let staging = StagingFile(parent.join(format!(".lindiction-update-{}.tmp", std::process::id())));
+    std::fs::copy(&extracted, staging.path())
+        .with_context(|| format!("copying new binary to {}", staging.path().display()))?;
+    std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("setting +x on {}", staging.path().display()))?;
     // Atomic swap. At this point a crash leaves either the old or the new
     // binary in place — never a truncated file. `rename` is guaranteed
     // atomic within a single filesystem.
-    std::fs::rename(&staging, &exe).with_context(|| {
+    std::fs::rename(staging.path(), &exe).with_context(|| {
         format!(
             "renaming {} -> {}; leaving staging file in place for inspection",
-            staging.display(),
+            staging.path().display(),
             exe.display()
         )
     })?;
     info!(path = %exe.display(), "tarball install complete");
-    cleanup_tmp(&tmp);
     Ok(())
-}
-
-fn make_tmp_dir() -> Result<PathBuf> {
-    let p = std::env::temp_dir().join(format!("lindiction-update-{}", std::process::id()));
-    // Remove-and-recreate: if a previous update attempt in the same daemon
-    // session left debris, we don't want sha256sum -c to find the old file
-    // and silently "verify" stale bytes.
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
-    Ok(p)
-}
-
-fn cleanup_tmp(p: &Path) {
-    if let Err(e) = std::fs::remove_dir_all(p) {
-        warn!(error = %e, path = %p.display(), "failed to clean up update temp dir");
-    }
 }
 
 async fn download(url: &str, dest: &Path) -> Result<()> {
@@ -378,6 +430,19 @@ fn verify_sha256(dir: &Path, sha_filename: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes the guard tests so they don't race each other on the
+    /// PID-keyed paths TempDir and StagingFile use. A panic in one test
+    /// poisons the mutex; later tests pull the lock with `.unwrap_or_else(|p| p.into_inner())`
+    /// so one failure doesn't cascade into spurious failures in siblings.
+    static GUARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn guard_lock() -> std::sync::MutexGuard<'static, ()> {
+        GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn detect_deb_from_system_paths() {
@@ -556,5 +621,71 @@ mod tests {
         let parsed: GithubRelease = serde_json::from_str(json).unwrap();
         let err = build_update_info(Version::parse("0.5.0").unwrap(), parsed).unwrap_err();
         assert!(format!("{err:#}").contains("not-a-version"));
+    }
+
+    #[test]
+    fn temp_dir_creates_and_removes_on_drop() {
+        let _lock = guard_lock();
+        let path;
+        {
+            let guard = TempDir::new().expect("creating TempDir");
+            path = guard.path().to_path_buf();
+            assert!(path.is_dir(), "TempDir::new must create the dir");
+        }
+        assert!(!path.exists(), "TempDir must remove the dir on drop");
+    }
+
+    #[test]
+    fn temp_dir_cleans_pre_existing_debris() {
+        let _lock = guard_lock();
+        // Simulate a leftover from a prior run.
+        let expected = std::env::temp_dir().join(format!("lindiction-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&expected);
+        std::fs::create_dir_all(&expected).unwrap();
+        std::fs::write(expected.join("stale.txt"), b"old").unwrap();
+
+        let guard = TempDir::new().expect("creating TempDir over debris");
+        // After new(), the dir exists but the stale file does not.
+        assert!(guard.path().is_dir());
+        assert!(!guard.path().join("stale.txt").exists(), "new() should wipe the old dir");
+        drop(guard);
+        assert!(!expected.exists());
+    }
+
+    #[test]
+    fn staging_file_drop_removes_file_if_still_present() {
+        let _lock = guard_lock();
+        let path = std::env::temp_dir().join(format!(
+            "lindiction-staging-test-leftover-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"contents").unwrap();
+        assert!(path.exists());
+
+        let guard = StagingFile(path.clone());
+        drop(guard);
+
+        assert!(!path.exists(), "StagingFile::drop must remove a still-present staging file");
+    }
+
+    #[test]
+    fn staging_file_drop_tolerates_missing_file() {
+        let _lock = guard_lock();
+
+        // Simulate the success path: by the time drop runs, the file the
+        // StagingFile was guarding has already been renamed away, so the
+        // remove_file inside Drop will see ENOENT. Must not log a warning
+        // or panic.
+        let path = std::env::temp_dir().join(format!(
+            "lindiction-staging-test-missing-{}.tmp",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists(), "precondition: path must not exist");
+
+        let guard = StagingFile(path.clone());
+        drop(guard);
+
+        assert!(!path.exists());
     }
 }
