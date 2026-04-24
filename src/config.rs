@@ -1,22 +1,10 @@
-use crate::model_choice::ModelId;
+use crate::hw_detect;
+use crate::model_choice::{self, ModelId};
+use crate::model_download;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
-
-/// Resolve the default model path to `$XDG_DATA_HOME/lindiction/models/ggml-small.en.bin`
-/// (typically `~/.local/share/lindiction/models/ggml-small.en.bin`).
-///
-/// This is the single source of truth for the default — consumed by
-/// `ModelConfig::default` AND by `model_download::ensure_default_model`
-/// (which only auto-downloads when `config.model.path == default_model_path()`).
-pub fn default_model_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from(".local/share"))
-        .join("lindiction")
-        .join("models")
-        .join("ggml-small.en.bin")
-}
 
 /// Path to the TOML config file: `$XDG_CONFIG_HOME/lindiction/config.toml`
 /// (typically `~/.config/lindiction/config.toml`). Returns `None` only when
@@ -40,6 +28,10 @@ pub struct Config {
     pub sample_rate: u32,
     #[serde(skip)]
     pub channels: u16,
+    /// Populated by `Config::load` when the model path was resolved via
+    /// hardware-based auto-selection (i.e. not explicitly set via CLI,
+    /// env, or TOML). Not serialized — purely runtime state consumed by
+    /// `model_download::ensure_model` to gate first-run download.
     #[serde(skip)]
     pub auto_selected_model: Option<ModelId>,
 }
@@ -153,8 +145,13 @@ impl Default for HotkeyConfig {
 
 impl Default for ModelConfig {
     fn default() -> Self {
+        // Empty PathBuf is the "not specified" sentinel. Config::load
+        // turns it into a concrete path via one of (CLI, env, TOML,
+        // hardware-auto). Users writing `path = ""` in TOML would
+        // also land here — that's not a useful config, and treating
+        // it as "not specified" is more charitable than erroring.
         Self {
-            path: default_model_path(),
+            path: PathBuf::new(),
         }
     }
 }
@@ -226,18 +223,47 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load config by merging: defaults → TOML file → env override → CLI override.
-    /// `cli_model` is `Some(path)` when the user passed `--model <PATH>`.
+    /// Resolve the full runtime config. Model-path precedence is:
+    ///   1. `--model` CLI flag (`cli_model`)
+    ///   2. `LINDICTION_MODEL` env var
+    ///   3. `[model].path` in TOML
+    ///   4. Hardware-based auto-selection via `hw_detect` + `model_choice`
+    ///
+    /// Only (4) sets `auto_selected_model`; the first three are treated as
+    /// explicit user choices and `model_download::ensure_model` will skip
+    /// auto-download for them.
     pub fn load(cli_model: Option<PathBuf>) -> Result<Self> {
         let mut config = Self::from_xdg_file()?;
 
-        if let Ok(env_path) = std::env::var("LINDICTION_MODEL") {
-            config.model.path = PathBuf::from(env_path);
+        // Precedence 1: CLI.
+        if let Some(p) = cli_model {
+            config.model.path = p;
+            config.auto_selected_model = None;
+            return Ok(config);
         }
-        if let Some(cli_path) = cli_model {
-            config.model.path = cli_path;
+        // Precedence 2: env var.
+        if let Ok(p) = std::env::var("LINDICTION_MODEL") {
+            if !p.is_empty() {
+                config.model.path = PathBuf::from(p);
+                config.auto_selected_model = None;
+                return Ok(config);
+            }
         }
-
+        // Precedence 3: TOML's explicit path (non-empty PathBuf).
+        if !config.model.path.as_os_str().is_empty() {
+            config.auto_selected_model = None;
+            return Ok(config);
+        }
+        // Precedence 4: hardware auto-selection.
+        let hw = hw_detect::detect();
+        let chosen = model_choice::recommend(&hw);
+        info!(
+            profile = ?hw,
+            chosen = chosen.tag(),
+            "auto-selected whisper model based on hardware"
+        );
+        config.model.path = model_download::default_model_path_for(chosen);
+        config.auto_selected_model = Some(chosen);
         Ok(config)
     }
 
@@ -282,11 +308,20 @@ mod tests {
 
     #[test]
     fn default_model_path_matches_xdg() {
+        // ModelConfig::default().path is now the empty-PathBuf sentinel
+        // meaning "not specified"; Config::load resolves it via
+        // CLI > env > TOML > hardware-auto.
         let c = Config::default();
-        assert_eq!(c.model.path, super::default_model_path());
-        // Verify the helper returns an absolute path ending with
-        // lindiction/models/ggml-small.en.bin.
-        let p = super::default_model_path();
+        assert!(
+            c.model.path.as_os_str().is_empty(),
+            "expected empty-path sentinel, got {}",
+            c.model.path.display()
+        );
+        // The canonical XDG path for SmallEn still lives in the models
+        // subdir — that's what model_download::default_model_path_for
+        // returns and what hardware-auto falls back to when the recommender
+        // picks SmallEn.
+        let p = crate::model_download::default_model_path_for(ModelId::SmallEn);
         assert!(
             p.ends_with("lindiction/models/ggml-small.en.bin"),
             "got {}",
@@ -432,13 +467,20 @@ ensure_trailing_period = false
 
     #[test]
     fn partial_toml_fills_from_default() {
+        // TOML that doesn't name [model] leaves ModelConfig::default()'s
+        // empty-PathBuf sentinel in place; resolution into a concrete
+        // path only happens inside Config::load.
         let s = r#"
 [hotkey]
 binding = "f10"
 "#;
         let c: Config = toml::from_str(s).expect("parse");
         assert_eq!(c.hotkey.binding, "f10");
-        assert_eq!(c.model.path, super::default_model_path());
+        assert!(
+            c.model.path.as_os_str().is_empty(),
+            "expected empty-path sentinel before Config::load runs; got {}",
+            c.model.path.display()
+        );
         assert!(c.postprocess.remove_fillers);
     }
 
@@ -462,7 +504,25 @@ nonsense = true
         isolate_xdg();
         std::env::remove_var("LINDICTION_MODEL");
         let c = Config::load(None).expect("load");
-        assert_eq!(c.model.path, super::default_model_path());
+        // With no CLI / env / TOML, hardware auto-selection fires. The
+        // actual model size depends on the test host's RAM/cores — so
+        // only verify that auto-selection populated the field and that
+        // the chosen path looks like a whisper ggml file.
+        assert!(
+            c.auto_selected_model.is_some(),
+            "expected hardware auto-selection to fire"
+        );
+        let fname = c
+            .model
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        assert!(
+            fname.starts_with("ggml-"),
+            "auto-selected path should be a ggml-*.bin file; got {}",
+            c.model.path.display()
+        );
         assert_eq!(c.hotkey.binding, "ctrl+alt+space");
         std::env::remove_var("XDG_CONFIG_HOME");
     }
@@ -473,6 +533,10 @@ nonsense = true
         std::env::set_var("LINDICTION_MODEL", "/from/env.bin");
         let c = Config::load(None).expect("load");
         assert_eq!(c.model.path, PathBuf::from("/from/env.bin"));
+        assert!(
+            c.auto_selected_model.is_none(),
+            "env-specified path must not auto-download"
+        );
         std::env::remove_var("LINDICTION_MODEL");
         std::env::remove_var("XDG_CONFIG_HOME");
     }
@@ -483,6 +547,10 @@ nonsense = true
         std::env::set_var("LINDICTION_MODEL", "/from/env.bin");
         let c = Config::load(Some(PathBuf::from("/from/cli.bin"))).expect("load");
         assert_eq!(c.model.path, PathBuf::from("/from/cli.bin"));
+        assert!(
+            c.auto_selected_model.is_none(),
+            "CLI-specified path must not auto-download"
+        );
         std::env::remove_var("LINDICTION_MODEL");
         std::env::remove_var("XDG_CONFIG_HOME");
     }
@@ -510,6 +578,10 @@ path = "/from/toml.bin"
         let c = Config::load(None).expect("load");
         assert_eq!(c.hotkey.binding, "f9");
         assert_eq!(c.model.path, PathBuf::from("/from/toml.bin"));
+        assert!(
+            c.auto_selected_model.is_none(),
+            "TOML-specified path must not auto-download"
+        );
 
         std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
@@ -552,5 +624,64 @@ path = "/from/toml.bin"
         if let Some(p) = super::config_file_path() {
             assert!(p.ends_with("lindiction/config.toml"), "got {}", p.display());
         }
+    }
+
+    #[test]
+    fn auto_selection_populates_auto_selected_model_when_nothing_set() {
+        isolate_xdg();
+        std::env::remove_var("LINDICTION_MODEL");
+        let c = Config::load(None).expect("load");
+        // Hardware auto-select must have fired — no CLI, no env, no TOML.
+        assert!(
+            c.auto_selected_model.is_some(),
+            "expected auto_selected_model to be populated; got {:?}",
+            c.auto_selected_model
+        );
+        // And the chosen path should live in the XDG models dir.
+        let parent = c.model.path.parent().unwrap();
+        assert!(
+            parent.ends_with("lindiction/models"),
+            "chosen path should live in XDG models dir; got {}",
+            c.model.path.display()
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn cli_path_clears_auto_selected_model() {
+        isolate_xdg();
+        std::env::remove_var("LINDICTION_MODEL");
+        let c = Config::load(Some(PathBuf::from("/from/cli.bin"))).expect("load");
+        assert_eq!(c.model.path, PathBuf::from("/from/cli.bin"));
+        assert!(
+            c.auto_selected_model.is_none(),
+            "CLI-specified path must not auto-download anything"
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn toml_path_clears_auto_selected_model() {
+        // TOML with an explicit [model].path must not trigger auto-download.
+        let dir = std::env::temp_dir().join("lindiction-config-auto-toml-path");
+        let cfg_dir = dir.join("lindiction");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"
+[model]
+path = "/from/toml.bin"
+"#,
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::remove_var("LINDICTION_MODEL");
+
+        let c = Config::load(None).expect("load");
+        assert_eq!(c.model.path, PathBuf::from("/from/toml.bin"));
+        assert!(c.auto_selected_model.is_none());
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
