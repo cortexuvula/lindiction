@@ -522,17 +522,31 @@ impl App {
             }
         }
 
-        // Explicitly close the transcribe channel BEFORE awaiting the worker.
-        // This is load-bearing: the worker's `while let Some(_) = rx.recv()` loop
-        // only exits when all senders are dropped. If we removed this line,
-        // NLL would drop `transcribe_tx` at end-of-scope — AFTER `worker.await` —
-        // and worker.await would deadlock. Non-negotiable ordering.
+        // Shutdown ordering is load-bearing:
+        //
+        //   drop(transcribe_tx)  — closes the worker's recv() loop so it stops
+        //                          pulling new utterances.
+        //   drop(done_rx)        — unblocks the worker's `done_tx_worker.send().await`.
+        //                          Without this, a backlog of >= the done-channel
+        //                          capacity at shutdown wedges the worker forever:
+        //                          it finishes a transcription, tries to send on
+        //                          a full done channel whose receiver we're no
+        //                          longer polling, and blocks. The worker's send
+        //                          arm handles is_err() by breaking, so after this
+        //                          drop the next send fails and the worker exits.
+        //   worker.await         — lets the worker finish whatever it's already
+        //                          mid-inference on (spawn_blocking can't be
+        //                          cancelled). That single in-flight utterance
+        //                          may block us up to ~800 ms; intentional, so
+        //                          an execve replacement doesn't drop a half-
+        //                          finished inference.
+        //
+        // Caveat: utterances still queued in transcribe_rx beyond the one the
+        // worker is actively processing are abandoned here. That's the accepted
+        // trade for predictable shutdown — a user clicking Quit/Restart wants
+        // the daemon to exit, not to finish a 10-utterance backlog first.
         drop(transcribe_tx);
-        // worker.await may block up to ~800 ms if a whisper spawn_blocking call
-        // is in flight at shutdown. This is intentional: we let the current
-        // inference finish rather than leaking a blocking thread. Restart
-        // paths rely on this invariant — an execve replacement after an
-        // incomplete inference would silently drop the utterance.
+        drop(done_rx);
         let _ = worker.await;
         Ok(exit_action)
     }
