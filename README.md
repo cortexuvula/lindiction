@@ -15,14 +15,27 @@ MVP scope: Ubuntu 24.04 / X11 / GNOME. Wayland, system tray, systemd service, `.
 
 ### From .deb (recommended)
 
-Download the latest `.deb` from the [releases page](https://github.com/cortexuvula/lindiction/releases) and install:
+Each release ships three `.deb` variants on the [releases page](https://github.com/cortexuvula/lindiction/releases). Pick the one matching your hardware:
+
+| Variant | Filename suffix | When to use |
+|---|---|---|
+| **CPU** (default) | `-amd64.deb` | Anything; works on every machine |
+| **CUDA** | `-amd64-cuda.deb` | NVIDIA GPU with CUDA runtime installed |
+| **Vulkan** | `-amd64-vulkan.deb` | Cross-vendor GPU (Intel Arc, AMD without ROCm, NVIDIA fallback) |
 
 ```bash
-wget https://github.com/cortexuvula/lindiction/releases/latest/download/lindiction-v0.3.0-amd64.deb
-sudo apt install ./lindiction-v0.3.0-amd64.deb
+# CPU build (works on every machine):
+wget https://github.com/cortexuvula/lindiction/releases/latest/download/lindiction-v0.8.1-amd64.deb
+sudo apt install ./lindiction-v0.8.1-amd64.deb
+
+# Or NVIDIA CUDA build:
+wget https://github.com/cortexuvula/lindiction/releases/latest/download/lindiction-v0.8.1-amd64-cuda.deb
+sudo apt install ./lindiction-v0.8.1-amd64-cuda.deb
 ```
 
-First run will auto-download the default small.en whisper model (~488 MB) to `~/.local/share/lindiction/models/` — expect a one-time delay of ~30 s to a few minutes depending on your connection.
+The auto-updater preserves the chosen backend across versions starting from v0.8.1 — installing the CUDA `.deb` once means future updates also pull the CUDA variant. (The AMD ROCm `hipblas` build isn't published as a `.deb` yet; use a source build with `--features hipblas` if you need it.)
+
+First run auto-downloads a Whisper model sized to your hardware (~75 MB to ~1.6 GB depending on RAM/VRAM) into `~/.local/share/lindiction/models/`. Expect a one-time delay of 30 s to a few minutes depending on your connection.
 
 ### From source
 
