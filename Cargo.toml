@@ -1,6 +1,6 @@
 [package]
 name = "lindiction"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 description = "Linux push-to-talk voice dictation"
 license = "MIT"
@@ -71,3 +71,24 @@ assets = [
     ["README.md", "usr/share/doc/lindiction/README", "644"],
     ["LICENSE", "usr/share/doc/lindiction/copyright", "644"],
 ]
+
+# GPU variants: build with `cargo deb --no-build --variant cuda` (or vulkan).
+# Both override `name = "lindiction"` so they upgrade the same dpkg package
+# rather than installing as parallel "lindiction-cuda" / "lindiction-vulkan"
+# entries — only one backend can be installed at a time anyway since they
+# all ship to /usr/bin/lindiction.
+#
+# Both variants drop `$auto` from `depends` so cargo-deb's dpkg-shlibdeps
+# doesn't pin the build runner's exact NVIDIA driver minor version
+# (e.g. `libnvidia-compute-535 (>= 535.288.01)`) — that fails to install
+# on hosts running any other driver release. We hand-list the deps the
+# binary actually needs at runtime, with major-version-only pins so any
+# CUDA 12.x or Vulkan 1.x system works.
+
+[package.metadata.deb.variants.cuda]
+name = "lindiction"
+depends = "libc6, libgcc-s1, libstdc++6, libasound2t64 | libasound2, libpulse0, libdbus-1-3, xdotool, curl, libcudart12, libcublas12, libcuda1"
+
+[package.metadata.deb.variants.vulkan]
+name = "lindiction"
+depends = "libc6, libgcc-s1, libstdc++6, libasound2t64 | libasound2, libpulse0, libdbus-1-3, xdotool, curl, libvulkan1"

@@ -88,7 +88,18 @@ jobs:
             > "lindiction-${REF_NAME}-x86_64-linux${TAR_SUFFIX}.tar.gz.sha256"
 
       - name: Build .deb
-        run: cargo deb --no-build
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          # GPU variants use cargo-deb's --variant flag to pick up the
+          # cuda/vulkan-specific [package.metadata.deb.variants.*] block,
+          # which overrides depends to drop the build-runner-pinned
+          # nvidia-compute-535 / driver-version asserts.
+          if [ "$BACKEND" = "cpu" ]; then
+            cargo deb --no-build
+          else
+            cargo deb --no-build --variant "$BACKEND"
+          fi
 
       - name: Rename .deb and create sha256
         env:
