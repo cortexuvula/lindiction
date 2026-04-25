@@ -36,7 +36,11 @@ jobs:
 
       - name: Install Vulkan dependencies
         if: matrix.backend == 'vulkan'
-        run: sudo apt-get install -y libvulkan-dev glslang-tools
+        # whisper.cpp's ggml-vulkan CMakeLists requires the `glslc` SPIR-V
+        # compiler from the shaderc project (NOT `glslangValidator` from
+        # glslang-tools — different project, different binary). Ubuntu
+        # noble's universe repo ships glslc directly.
+        run: sudo apt-get install -y libvulkan-dev glslc
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
