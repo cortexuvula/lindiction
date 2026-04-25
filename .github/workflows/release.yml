@@ -12,9 +12,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Build and publish release binary
+  build:
+    name: Build ${{ matrix.backend }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, cuda, vulkan]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,53 +30,126 @@ jobs:
             build-essential cmake pkg-config \
             libclang-dev libasound2-dev libpulse-dev libdbus-1-dev
 
+      - name: Install CUDA toolkit
+        if: matrix.backend == 'cuda'
+        run: sudo apt-get install -y nvidia-cuda-toolkit
+
+      - name: Install Vulkan dependencies
+        if: matrix.backend == 'vulkan'
+        run: sudo apt-get install -y libvulkan-dev glslang-tools
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.backend }}
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked --version "^2"
 
       - name: Build release binary
-        run: cargo build --release --locked
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          if [ "$BACKEND" = "cpu" ]; then
+            cargo build --release --locked
+          else
+            cargo build --release --locked --features "$BACKEND"
+          fi
+
+      - name: Compute artifact name suffix
+        id: suffix
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          if [ "$BACKEND" = "cpu" ]; then
+            echo "tar=" >> "$GITHUB_OUTPUT"
+            echo "deb=" >> "$GITHUB_OUTPUT"
+          else
+            echo "tar=-$BACKEND" >> "$GITHUB_OUTPUT"
+            echo "deb=-$BACKEND" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Package tarball
         env:
           REF_NAME: ${{ github.ref_name }}
+          TAR_SUFFIX: ${{ steps.suffix.outputs.tar }}
         run: |
           cd target/release
-          tar -czf "../../lindiction-${REF_NAME}-x86_64-linux.tar.gz" lindiction
+          tar -czf "../../lindiction-${REF_NAME}-x86_64-linux${TAR_SUFFIX}.tar.gz" lindiction
           cd ../..
-          sha256sum "lindiction-${REF_NAME}-x86_64-linux.tar.gz" > "lindiction-${REF_NAME}-x86_64-linux.tar.gz.sha256"
+          sha256sum "lindiction-${REF_NAME}-x86_64-linux${TAR_SUFFIX}.tar.gz" \
+            > "lindiction-${REF_NAME}-x86_64-linux${TAR_SUFFIX}.tar.gz.sha256"
 
       - name: Build .deb
         run: cargo deb --no-build
 
-      - name: Rename .deb to include tag
+      - name: Rename .deb and create sha256
         env:
           REF_NAME: ${{ github.ref_name }}
+          DEB_SUFFIX: ${{ steps.suffix.outputs.deb }}
         run: |
           # cargo-deb names the file from Cargo.toml's version;
           # prefer a tag-based name for the release attachment.
-          cp target/debian/lindiction_*_amd64.deb "./lindiction-${REF_NAME}-amd64.deb"
+          cp target/debian/lindiction_*_amd64.deb \
+             "./lindiction-${REF_NAME}-amd64${DEB_SUFFIX}.deb"
           # Publish a SHA256 sidecar alongside the .deb so the auto-updater
           # (see src/update.rs) can verify integrity the same way it does
           # for the tarball. Defense-in-depth: HTTPS + GitHub already cover
           # transport, but this catches storage bit-rot and keeps verification
           # consistent across install methods.
-          sha256sum "lindiction-${REF_NAME}-amd64.deb" > "lindiction-${REF_NAME}-amd64.deb.sha256"
+          sha256sum "lindiction-${REF_NAME}-amd64${DEB_SUFFIX}.deb" \
+            > "lindiction-${REF_NAME}-amd64${DEB_SUFFIX}.deb.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lindiction-${{ matrix.backend }}
+          path: |
+            lindiction-*-x86_64-linux*.tar.gz*
+            lindiction-*-amd64*.deb*
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect into release/
+        run: |
+          mkdir -p release/
+          find artifacts/ -type f -exec mv {} release/ \;
+          echo "::group::Files for release"
+          ls -la release/
+          echo "::endgroup::"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          cd release/
           gh release create "${REF_NAME}" \
             --title "${REF_NAME}" \
             --generate-notes \
             "lindiction-${REF_NAME}-x86_64-linux.tar.gz" \
             "lindiction-${REF_NAME}-x86_64-linux.tar.gz.sha256" \
             "lindiction-${REF_NAME}-amd64.deb" \
-            "lindiction-${REF_NAME}-amd64.deb.sha256"
+            "lindiction-${REF_NAME}-amd64.deb.sha256" \
+            "lindiction-${REF_NAME}-x86_64-linux-cuda.tar.gz" \
+            "lindiction-${REF_NAME}-x86_64-linux-cuda.tar.gz.sha256" \
+            "lindiction-${REF_NAME}-amd64-cuda.deb" \
+            "lindiction-${REF_NAME}-amd64-cuda.deb.sha256" \
+            "lindiction-${REF_NAME}-x86_64-linux-vulkan.tar.gz" \
+            "lindiction-${REF_NAME}-x86_64-linux-vulkan.tar.gz.sha256" \
+            "lindiction-${REF_NAME}-amd64-vulkan.deb" \
+            "lindiction-${REF_NAME}-amd64-vulkan.deb.sha256"
