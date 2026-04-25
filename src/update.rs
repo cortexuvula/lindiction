@@ -114,6 +114,36 @@ pub async fn check() -> Result<Option<UpdateInfo>> {
     build_update_info(current, parsed)
 }
 
+/// Build the asset suffix for the running daemon's compiled backend.
+/// CPU build → unchanged from v0.7.0 conventions ("-amd64.deb" /
+/// "-x86_64-linux.tar.gz") so v0.7.0/v0.8.0 daemons keep finding the
+/// right artifact in v0.8.1+ releases. GPU builds → backend-specific
+/// suffix that won't match the cpu artifact (e.g. "-amd64-cuda.deb",
+/// "-x86_64-linux-cuda.tar.gz").
+fn pick_suffix(base_suffix: &str, backend: &str) -> String {
+    if backend == "cpu" {
+        return base_suffix.to_string();
+    }
+    // base_suffix is something like "-amd64.deb" or "-x86_64-linux.tar.gz".
+    // Insert the backend tag before the final extension. We split at the
+    // last `.` rather than hardcoding ".deb" / ".tar.gz" so future suffixes
+    // (e.g. ".tar.zst") work without changes here.
+    if let Some(dot) = base_suffix.rfind('.') {
+        // For ".tar.gz", we want to split at the FIRST dot in ".tar.gz",
+        // not the last (otherwise we'd produce "-x86_64-linux.tar-cuda.gz").
+        // Detect the compound extension and adjust.
+        let (stem, ext) = if base_suffix.ends_with(".tar.gz") {
+            let cut = base_suffix.len() - ".tar.gz".len();
+            (&base_suffix[..cut], ".tar.gz")
+        } else {
+            (&base_suffix[..dot], &base_suffix[dot..])
+        };
+        return format!("{stem}-{backend}{ext}");
+    }
+    // Suffix without an extension is unusual; fall back to plain.
+    base_suffix.to_string()
+}
+
 fn build_update_info(current: Version, parsed: GithubRelease) -> Result<Option<UpdateInfo>> {
     let latest_str = parsed.tag_name.trim_start_matches('v');
     let latest = Version::parse(latest_str)
@@ -124,6 +154,10 @@ fn build_update_info(current: Version, parsed: GithubRelease) -> Result<Option<U
     }
     // Find the four assets we need. SHA256 sidecars are distinguished by
     // the `.sha256` suffix; exclude those from the primary-asset lookups.
+    let backend = crate::COMPILED_BACKEND;
+    let deb_suffix = pick_suffix("-amd64.deb", backend);
+    let tarball_suffix = pick_suffix("-x86_64-linux.tar.gz", backend);
+
     let find_primary = |suffix: &str| -> Option<&GithubAsset> {
         parsed
             .assets
@@ -134,17 +168,27 @@ fn build_update_info(current: Version, parsed: GithubRelease) -> Result<Option<U
         let combined = format!("{suffix}.sha256");
         parsed.assets.iter().find(|a| a.name.ends_with(&combined))
     };
-    let deb = find_primary("-amd64.deb")
-        .ok_or_else(|| anyhow!("release {} is missing a .deb asset", parsed.tag_name))?;
-    let tarball = find_primary("-x86_64-linux.tar.gz")
-        .ok_or_else(|| anyhow!("release {} is missing a tarball asset", parsed.tag_name))?;
-    let tarball_sha = find_sha("-x86_64-linux.tar.gz").ok_or_else(|| {
+    let deb = find_primary(&deb_suffix).ok_or_else(|| {
         anyhow!(
-            "release {} is missing a tarball .sha256 asset",
+            "release {} is missing a .deb asset for backend `{backend}` \
+             (looked for suffix `{deb_suffix}`)",
             parsed.tag_name
         )
     })?;
-    let deb_sha = find_sha("-amd64.deb");
+    let tarball = find_primary(&tarball_suffix).ok_or_else(|| {
+        anyhow!(
+            "release {} is missing a tarball asset for backend `{backend}` \
+             (looked for suffix `{tarball_suffix}`)",
+            parsed.tag_name
+        )
+    })?;
+    let tarball_sha = find_sha(&tarball_suffix).ok_or_else(|| {
+        anyhow!(
+            "release {} is missing a tarball SHA256 sidecar for backend `{backend}`",
+            parsed.tag_name
+        )
+    })?;
+    let deb_sha = find_sha(&deb_suffix);
     Ok(Some(UpdateInfo {
         current,
         latest,
@@ -687,5 +731,99 @@ mod tests {
         drop(guard);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn pick_suffix_cpu_backend_returns_unchanged() {
+        // Backward-compatible behavior — what v0.7.0 / v0.8.0 daemons assume.
+        assert_eq!(pick_suffix("-amd64.deb", "cpu"), "-amd64.deb");
+        assert_eq!(
+            pick_suffix("-x86_64-linux.tar.gz", "cpu"),
+            "-x86_64-linux.tar.gz"
+        );
+    }
+
+    #[test]
+    fn pick_suffix_inserts_backend_before_simple_extension() {
+        // .deb is a single-segment extension.
+        assert_eq!(pick_suffix("-amd64.deb", "cuda"), "-amd64-cuda.deb");
+        assert_eq!(pick_suffix("-amd64.deb", "vulkan"), "-amd64-vulkan.deb");
+        assert_eq!(pick_suffix("-amd64.deb", "hipblas"), "-amd64-hipblas.deb");
+    }
+
+    #[test]
+    fn pick_suffix_inserts_backend_before_compound_extension() {
+        // .tar.gz is a compound extension — must NOT be split as ".tar" + ".gz".
+        assert_eq!(
+            pick_suffix("-x86_64-linux.tar.gz", "cuda"),
+            "-x86_64-linux-cuda.tar.gz"
+        );
+        assert_eq!(
+            pick_suffix("-x86_64-linux.tar.gz", "vulkan"),
+            "-x86_64-linux-vulkan.tar.gz"
+        );
+    }
+
+    #[test]
+    fn pick_suffix_unknown_backend_passes_through() {
+        // Defensive: if a future backend name appears, generate the
+        // mechanical pattern; the asset just won't be found in the release
+        // and the user gets a clear error.
+        assert_eq!(pick_suffix("-amd64.deb", "future"), "-amd64-future.deb");
+    }
+
+    #[test]
+    fn build_update_info_finds_cuda_assets_when_present() {
+        // Simulates a v0.8.1 release with both cpu and cuda artifacts.
+        // Construction is via canned JSON so we can drive the code path even
+        // on a cpu build (we'd need to fake COMPILED_BACKEND to test the
+        // cuda code path end-to-end, which we can't from a test). What this
+        // test actually verifies is that the cpu daemon STILL picks the cpu
+        // artifact even when the cuda artifact is present.
+        let json = r#"{
+            "tag_name": "v0.8.1",
+            "html_url": "https://x",
+            "assets": [
+                {"name": "lindiction-v0.8.1-x86_64-linux.tar.gz",            "browser_download_url": "u_cpu_tar"},
+                {"name": "lindiction-v0.8.1-x86_64-linux.tar.gz.sha256",     "browser_download_url": "u_cpu_tar_sha"},
+                {"name": "lindiction-v0.8.1-amd64.deb",                       "browser_download_url": "u_cpu_deb"},
+                {"name": "lindiction-v0.8.1-amd64.deb.sha256",                "browser_download_url": "u_cpu_deb_sha"},
+                {"name": "lindiction-v0.8.1-x86_64-linux-cuda.tar.gz",        "browser_download_url": "u_cuda_tar"},
+                {"name": "lindiction-v0.8.1-x86_64-linux-cuda.tar.gz.sha256", "browser_download_url": "u_cuda_tar_sha"},
+                {"name": "lindiction-v0.8.1-amd64-cuda.deb",                  "browser_download_url": "u_cuda_deb"},
+                {"name": "lindiction-v0.8.1-amd64-cuda.deb.sha256",           "browser_download_url": "u_cuda_deb_sha"}
+            ]
+        }"#;
+        let parsed: GithubRelease = serde_json::from_str(json).unwrap();
+        let info = build_update_info(Version::parse("0.7.0").unwrap(), parsed)
+            .unwrap()
+            .expect("0.7.0 should see 0.8.1 as newer");
+        // On a CPU build, MUST select the unsuffixed cpu artifacts.
+        assert_eq!(info.deb_url, "u_cpu_deb");
+        assert_eq!(info.tarball_url, "u_cpu_tar");
+        assert_eq!(info.deb_sha256_url.as_deref(), Some("u_cpu_deb_sha"));
+        assert_eq!(info.tarball_sha256_url, "u_cpu_tar_sha");
+    }
+
+    #[test]
+    fn build_update_info_legacy_release_still_works_for_cpu() {
+        // A v0.7.0-style release (no GPU artifacts) must still resolve
+        // cleanly for a cpu build. This is the backward-compat invariant.
+        let json = r#"{
+            "tag_name": "v0.8.1",
+            "html_url": "https://x",
+            "assets": [
+                {"name": "lindiction-v0.8.1-x86_64-linux.tar.gz",        "browser_download_url": "u_tar"},
+                {"name": "lindiction-v0.8.1-x86_64-linux.tar.gz.sha256", "browser_download_url": "u_tar_sha"},
+                {"name": "lindiction-v0.8.1-amd64.deb",                  "browser_download_url": "u_deb"},
+                {"name": "lindiction-v0.8.1-amd64.deb.sha256",           "browser_download_url": "u_deb_sha"}
+            ]
+        }"#;
+        let parsed: GithubRelease = serde_json::from_str(json).unwrap();
+        let info = build_update_info(Version::parse("0.7.0").unwrap(), parsed)
+            .unwrap()
+            .expect("0.7.0 should see 0.8.1 as newer");
+        assert_eq!(info.deb_url, "u_deb");
+        assert_eq!(info.tarball_url, "u_tar");
     }
 }
