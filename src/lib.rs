@@ -5,6 +5,7 @@ pub mod config;
 pub mod hotkey;
 pub mod hw_detect;
 pub mod inject;
+pub mod mic_select;
 pub mod model_choice;
 pub mod model_download;
 pub mod postprocess;
