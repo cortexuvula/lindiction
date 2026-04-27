@@ -56,6 +56,14 @@ pub struct AudioConfig {
     /// is enough to cover typical reaction time between the user
     /// starting to speak and the hotkey actually registering.
     pub preroll_ms: u32,
+    /// Override the system default input device. None (the default)
+    /// uses whatever the audio server reports as the user's default
+    /// source — picks up changes from `pactl set-default-source` /
+    /// WirePlumber metadata automatically. Some(name) pins to a
+    /// specific cpal-level device name (whatever `Device::name()`
+    /// returned at enumeration time). Set via the tray menu's
+    /// "Microphone" submenu, or hand-edited.
+    pub device: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -158,7 +166,10 @@ impl Default for ModelConfig {
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { preroll_ms: 300 }
+        Self {
+            preroll_ms: 300,
+            device: None,
+        }
     }
 }
 
@@ -387,6 +398,20 @@ mod tests {
     fn default_audio_config() {
         let c = Config::default();
         assert_eq!(c.audio.preroll_ms, 300);
+        assert!(c.audio.device.is_none());
+    }
+
+    #[test]
+    fn audio_device_override_parses() {
+        let s = r#"
+[audio]
+device = "alsa_input.pci-0000_08_00.4.analog-stereo"
+"#;
+        let c: Config = toml::from_str(s).expect("parse");
+        assert_eq!(
+            c.audio.device.as_deref(),
+            Some("alsa_input.pci-0000_08_00.4.analog-stereo")
+        );
     }
 
     #[test]

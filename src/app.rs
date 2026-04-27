@@ -233,8 +233,11 @@ impl App {
         let (_hotkey_listener, mut hotkey_rx): (HotkeyListener, _) = start_hotkey(modifiers, code)?;
 
         // Audio stream
-        let (_audio_stream, mut audio_rx): (AudioStream, _) =
-            start_capture(config.sample_rate, config.channels)?;
+        let (_audio_stream, mut audio_rx): (AudioStream, _) = start_capture(
+            config.sample_rate,
+            config.channels,
+            config.audio.device.as_deref(),
+        )?;
 
         info!(hotkey = %config.hotkey.binding, "ready — hold the hotkey to dictate");
 
