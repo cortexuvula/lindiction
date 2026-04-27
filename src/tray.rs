@@ -130,7 +130,7 @@ impl ksni::Tray for LindictionTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{CheckmarkItem, StandardItem};
+        use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
         let mut items: Vec<ksni::MenuItem<Self>> = Vec::new();
 
         // "Update to vX.Y.Z…" goes above everything else when present —
@@ -157,6 +157,14 @@ impl ksni::Tray for LindictionTray {
                 label: "Pause".into(),
                 checked: self.paused,
                 activate: Box::new(|this: &mut Self| toggle_pause(this)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            SubMenu {
+                label: "Microphone".into(),
+                submenu: build_microphone_submenu(),
                 ..Default::default()
             }
             .into(),
@@ -357,6 +365,78 @@ impl Drop for TrayManager {
         // Tell the ksni background thread to stop its polling loop and
         // release the DBus name cleanly.
         self.handle.shutdown();
+    }
+}
+
+/// Build the Microphone submenu fresh on each menu open. Reads the
+/// current `[audio].device` setting from config (so the active item
+/// is correctly marked) and enumerates available cpal devices via
+/// `audio::list_input_devices`. Both calls are cheap; we keep them
+/// out of the hot path by virtue of being inside ksni's on-demand
+/// menu render.
+fn build_microphone_submenu() -> Vec<ksni::MenuItem<LindictionTray>> {
+    use ksni::menu::CheckmarkItem;
+
+    // None means "no override; track system default". Errors degrade
+    // to None — the user can still re-pick from the menu.
+    let current = crate::mic_select::current_device().unwrap_or(None);
+    let devices = crate::audio::list_input_devices();
+
+    let mut items: Vec<ksni::MenuItem<LindictionTray>> = Vec::new();
+
+    // "System default" item — checked when no override is configured.
+    items.push(
+        CheckmarkItem {
+            label: "System default".into(),
+            checked: current.is_none(),
+            activate: Box::new(|this: &mut LindictionTray| {
+                select_device(this, None);
+            }),
+            ..Default::default()
+        }
+        .into(),
+    );
+
+    items.push(ksni::MenuItem::Separator);
+
+    // One row per device. Closure captures the name by move so the
+    // click handler has a stable reference to use after `devices` is
+    // dropped.
+    for d in devices {
+        let captured_name = d.name.clone();
+        let is_active = current.as_deref() == Some(d.name.as_str());
+        items.push(
+            CheckmarkItem {
+                label: d.name,
+                checked: is_active,
+                activate: Box::new(move |this: &mut LindictionTray| {
+                    select_device(this, Some(&captured_name));
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+    }
+
+    items
+}
+
+/// Persist the chosen mic to `[audio].device` and ask the daemon to
+/// restart so the new device takes effect. On config-write failure,
+/// surface a desktop notification and leave the running daemon
+/// alone — same approach as `toggle_autostart` for analogous errors.
+fn select_device(this: &mut LindictionTray, name: Option<&str>) {
+    if let Err(e) = crate::mic_select::set_device(name) {
+        warn!(error = %e, "failed to write [audio].device to config");
+        notify_warn(&format!("Could not save microphone choice: {e}"));
+        return;
+    }
+    info!(
+        chosen = name.unwrap_or("(system default)"),
+        "microphone changed via tray; restarting daemon"
+    );
+    if this.control_tx.send(ControlCmd::Restart).is_err() {
+        warn!("control channel closed; mic-switch restart dropped");
     }
 }
 
