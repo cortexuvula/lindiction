@@ -144,6 +144,31 @@ fn pick_suffix(base_suffix: &str, backend: &str) -> String {
     base_suffix.to_string()
 }
 
+/// Extract the trailing filename from an asset URL.
+///
+/// install_deb / install_tarball use this to keep the local download
+/// filename in lock-step with the asset name embedded in the .sha256
+/// sidecar. The release CI generates each sidecar with
+/// `sha256sum FILENAME > FILENAME.sha256`, so the sidecar's content
+/// is `<hash>  FILENAME`. If we save the downloaded artifact under
+/// any other name, `sha256sum -c` looks for FILENAME on disk and
+/// rejects the verification with "No such file or directory" — the
+/// exact failure mode that broke v0.8.3 cuda → v0.9.0 auto-update.
+fn basename_from_url(url: &str) -> Result<String> {
+    // Strip any query string or fragment first; release URLs don't
+    // have these today, but defensive against future format changes.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    // Look at the rightmost segment specifically — a URL ending in `/`
+    // has no filename, even if there are non-empty segments earlier in
+    // the path.
+    let last = path
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("url has no filename component: {url}"))?;
+    Ok(last.to_string())
+}
+
 fn build_update_info(current: Version, parsed: GithubRelease) -> Result<Option<UpdateInfo>> {
     let latest_str = parsed.tag_name.trim_start_matches('v');
     let latest = Version::parse(latest_str)
@@ -329,7 +354,15 @@ impl Drop for StagingFile {
 
 async fn install_deb(info: &UpdateInfo) -> Result<()> {
     let tmp = TempDir::new()?;
-    let deb_filename = format!("lindiction-{}-amd64.deb", info.tag_name);
+    // Derive local filenames from the asset URLs. The .sha256 sidecars
+    // produced by the release CI contain the upstream asset filename
+    // verbatim (`sha256sum lindiction-vX.Y.Z-amd64-cuda.deb > ....sha256`),
+    // so the local download filename MUST match — otherwise sha256sum -c
+    // looks for a name that doesn't exist on disk and rejects the
+    // verification. Using the URL's basename keeps the two in sync
+    // regardless of backend (cpu / cuda / vulkan / hipblas).
+    let deb_filename = basename_from_url(&info.deb_url)
+        .context("could not derive .deb filename from deb_url")?;
     let deb_path = tmp.join(&deb_filename);
     download(&info.deb_url, &deb_path).await?;
     if let Some(sha_url) = &info.deb_sha256_url {
@@ -367,7 +400,10 @@ async fn install_tarball(info: &UpdateInfo) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = TempDir::new()?;
-    let tarball_filename = format!("lindiction-{}-x86_64-linux.tar.gz", info.tag_name);
+    // See install_deb for why local filenames must mirror the URL's
+    // basename rather than being hand-formatted with a fixed suffix.
+    let tarball_filename = basename_from_url(&info.tarball_url)
+        .context("could not derive tarball filename from tarball_url")?;
     let sha_filename = format!("{tarball_filename}.sha256");
     let tarball_path = tmp.join(&tarball_filename);
     let sha_path = tmp.join(&sha_filename);
@@ -770,6 +806,52 @@ mod tests {
         // mechanical pattern; the asset just won't be found in the release
         // and the user gets a clear error.
         assert_eq!(pick_suffix("-amd64.deb", "future"), "-amd64-future.deb");
+    }
+
+    #[test]
+    fn basename_from_url_extracts_cpu_filename() {
+        let url = "https://github.com/cortexuvula/lindiction/releases/download/v0.9.0/lindiction-v0.9.0-amd64.deb";
+        assert_eq!(
+            basename_from_url(url).unwrap(),
+            "lindiction-v0.9.0-amd64.deb"
+        );
+    }
+
+    #[test]
+    fn basename_from_url_extracts_cuda_filename() {
+        // Regression test for the v0.8.3 bug: when the URL is the cuda
+        // variant, the local filename MUST also be the cuda variant so
+        // the sha256 sidecar's reference resolves on disk.
+        let url = "https://github.com/cortexuvula/lindiction/releases/download/v0.9.0/lindiction-v0.9.0-amd64-cuda.deb";
+        assert_eq!(
+            basename_from_url(url).unwrap(),
+            "lindiction-v0.9.0-amd64-cuda.deb"
+        );
+    }
+
+    #[test]
+    fn basename_from_url_extracts_tarball_compound_extension() {
+        let url = "https://example.test/path/lindiction-v0.9.0-x86_64-linux-vulkan.tar.gz";
+        assert_eq!(
+            basename_from_url(url).unwrap(),
+            "lindiction-v0.9.0-x86_64-linux-vulkan.tar.gz"
+        );
+    }
+
+    #[test]
+    fn basename_from_url_strips_query_string() {
+        let url = "https://example.test/lindiction-v0.9.0-amd64-cuda.deb?token=abc&t=123";
+        assert_eq!(
+            basename_from_url(url).unwrap(),
+            "lindiction-v0.9.0-amd64-cuda.deb"
+        );
+    }
+
+    #[test]
+    fn basename_from_url_rejects_trailing_slash() {
+        // A URL ending in / has no filename — release asset URLs from
+        // GitHub never look like this, but rejecting it is cheap insurance.
+        assert!(basename_from_url("https://example.test/").is_err());
     }
 
     #[test]
